@@ -32,7 +32,7 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 原因（reason）
 
-翻译失败的用户可见分类，固定五项：`未配置`、`模型不可达`、`超时`、`后端返回错误`、`用户中断`。
+翻译失败的用户可见分类，固定五项：`not configured`、`model unreachable`、`timeout`、`backend error`、`interrupted`。
 
 ## 确定性失败（deterministic failure）
 

@@ -31,7 +31,7 @@
 | 内层分页器 | `MAN_AI_PAGER` → `PAGER` → `less -sR` 解析出的分页器 |
 | 块 | 连续非空行组成的翻译单元；空行是唯一块边界 |
 | 页首行 / 尾行 | 写入内层分页器的第一行 / 最后一行 |
-| 原因 | 固定五项：`未配置`、`模型不可达`、`超时`、`后端返回错误`、`用户中断` |
+| 原因 | 固定五项：`not configured`、`model unreachable`、`timeout`、`backend error`、`interrupted` |
 | 规范语言标签 | 按 BCP-47 形态校正大小写后的标签，如 `zh-Hant-TW` |
 
 ## 3. 运行模式与入口
@@ -85,7 +85,7 @@
 
 | 参数 | 行为 | 退出码 |
 |---|---|---|
-| `--help` | stdout 打印 man-ai 自己的用法：用法行、5 个自有参数、`MANPAGER` / `MAN_AI_PAGER` / `--lang` / `--translate` 说明，末行「其余参数原样交给 man」。不启动 man | 0 |
+| `--help` | stdout 打印 man-ai 自己的用法：用法行、5 个自有参数、`MANPAGER` / `MAN_AI_PAGER` / `--lang` / `--translate` 说明，末行 `All other arguments are passed to man unchanged.`。不启动 man | 0 |
 | `--version` | stdout 打印 `man-ai <semver>`。不启动 man | 0 |
 | `--lang <tag>` / `--lang=<tag>` | 覆盖语言来源链的最高优先级。缺失、空串或形状非法见 §11.6 | 见 §4.4 |
 | `--translate` | 强制翻译；非 TTY 也译。仅薄壳自身判定，不透传给 man | 沿用 man |
@@ -114,7 +114,7 @@ MANPAGER="man-ai [--lang <规范标签>] [--no-translate|--translate]"
 
 argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 
-1. 向 stderr 写一行 `man-ai: -P 覆盖 MANPAGER，本次不翻译`。
+1. 向 stderr 写一行 `man-ai: -P overrides MANPAGER; not translating`。
 2. 不设置 `MANPAGER`，不设置 `MAN_AI_PAGER`。
 3. 摘除自有参数（否则 man 会收到 `--lang` 等报错），其余参数原样 `exec man`。
 4. `--translate` 不能翻盘；内层分页器就是 `-P` 指定的那个。
@@ -183,7 +183,7 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 2. 运行 `man` 与剩余参数，读 stdout 到 EOF。
 3. 若捕获为空：原样透传 man 的 stderr 与退出码，不翻译。
 4. 否则走与 §5.2 相同的切块、翻译、按序写出，结果直写 stdout；没有页首行与尾行。
-5. 成功静默。全部块回退时，向 stderr 写一行 `man-ai: 翻译失败（<原因>），以下为原文`，然后写原文。部分块回退不写提示。
+5. 成功静默。全部块回退时，向 stderr 写一行 `man-ai: translation failed (<reason>), showing the original below`，然后写原文。部分块回退不写提示。
 6. 退出码取 man 的退出码；翻译失败不改变它。
 
 分页器模式在 stdout 非 TTY 且 argv 带 `--translate` 时（例如 `MANPAGER="man-ai --translate"` 在 BSD man 下被调用）执行相同的第 4 至 6 步，但输入已经是 stdin，不运行 man。
@@ -197,9 +197,9 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 3. 捕获为空：不翻译、不起分页器、不写页首行，透传退出码。
 4. 逐行处理，保留行尾。每行在**第一个** `" - "` 处切成名字列与描述；名字列（含 `name(section)`、逗号、padding、省略号）逐字节保留，只替换描述。没有 `" - "` 的行原样保留、不送翻译。
 5. 收集所有可翻译描述为 JSON 字符串数组，一次请求（§7.6）。非 UTF-8 行不送模型，原样保留。数组为空时不发请求、不写页首行，结果原样交给内层分页器或直写 stdout。
-6. 采用：名字列 + 译文描述 + 原行尾。整批失败：所有描述保留原文。至少一个描述采用时页首行用「已翻译」，整批失败用「翻译失败」。
+6. 采用：名字列 + 译文描述 + 原行尾。整批失败：所有描述保留原文。至少一个描述采用时页首行用 `translated` 形态，整批失败用 `translation failed` 形态。
 7. stdout 是 TTY：页首行 + 空行 + 结果行交内层分页器链，退出码取分页器；链不可用时直写 stdout，退出码取 man 的。
-8. stdout 非 TTY：直写 stdout，不写页首行。成功静默；整批失败时 stderr 一行 `man-ai: 翻译失败（<原因>），以下为原文` 再写原文。
+8. stdout 非 TTY：直写 stdout，不写页首行。成功静默；整批失败时 stderr 一行 `man-ai: translation failed (<reason>), showing the original below` 再写原文。
 9. 不重新计算列宽、不重新折行；超宽行交给 less 横向滚动或折行。
 
 ### 5.5 内层分页器
@@ -218,10 +218,10 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 ### 5.6 信号、超时与失败
 
 - **超时**：`timeout_seconds` 是单次请求上限，默认 30 秒，从发出请求到响应体读完。超时不重试，该块回退原文。整页不设总预算。
-- **Ctrl-C 两阶段**：翻译期间（内层分页器尚未启动）捕获 SIGINT。第一次取消翻译、未提交的块按序写原文，尾行原因 `用户中断`，然后照常启动分页器。启动分页器前恢复 SIGINT 默认处置；第二次 Ctrl-C 按默认行为结束进程。
+- **Ctrl-C 两阶段**：翻译期间（内层分页器尚未启动）捕获 SIGINT。第一次取消翻译、未提交的块按序写原文，尾行原因 `interrupted`，然后照常启动分页器。启动分页器前恢复 SIGINT 默认处置；第二次 Ctrl-C 按默认行为结束进程。
 - **SIGPIPE / EPIPE**：内层分页器提前退出（如按 `q`）导致写入失败时，停止发起新请求、丢弃在途请求（不等待）、停止写入、等待子进程、透传其退出码。此时不写尾行。
 - **SIGTERM / SIGHUP**：不做特殊处理，默认处置。
-- **配置问题**：配置文件读不到或解析失败时向 stderr 打一行警告，按默认值继续；未配置后端归入 `未配置` 原因回退原文。任何配置问题都不阻止页面显示、不改变退出码。
+- **配置问题**：配置文件读不到或解析失败时向 stderr 打一行警告，按默认值继续；未配置后端归入 `not configured` 原因回退原文。任何配置问题都不阻止页面显示、不改变退出码。
 - **缓存不可用**：向 stderr 一次性警告，关闭缓存继续，翻译结果不变。
 
 ### 5.7 时序
@@ -458,7 +458,7 @@ stateDiagram-v2
 页首行（进入翻译路径且至少 1 个块时始终写出）：
 
 ```text
-── man-ai：译文（<目标语言>）──
+── man-ai: translation (<language>) ──
 ```
 
 页首行后写一个空行，再写正文。
@@ -467,21 +467,21 @@ stateDiagram-v2
 
 | 情形 | 尾行 |
 |---|---|
-| 全部块采用 | `── man-ai：已翻译（<目标语言>）──` |
-| 部分块回退（含全部块因可重试失败而回退） | `── man-ai：部分翻译（<k>/<n> 块，<原因>）──` |
-| 确定性失败或第一次 Ctrl-C 导致剩余块为原文 | `── man-ai：翻译失败（<原因>），未完成部分为原文 ──` |
+| 全部块采用 | `── man-ai: translated (<language>) ──` |
+| 部分块回退（含全部块因可重试失败而回退） | `── man-ai: partially translated (<k>/<n> blocks, <reason>) ──` |
+| 确定性失败或第一次 Ctrl-C 导致剩余块为原文 | `── man-ai: translation failed (<reason>), remaining blocks left untranslated ──` |
 
-- `<目标语言>` 取 §11.4 的显示名。
-- `<原因>` 取失败块中出现最多的原因，并列时取最先出现的块。
+- `<language>` 取 §11.4 的显示名。
+- `<reason>` 取失败块中出现最多的原因，并列时取最先出现的块。
 - 页首行与尾行不参与缓存键。
-- `-k` 路径没有尾行；页首行按 §5.4 使用两形态：`── man-ai：已翻译（<目标语言>）──` 或 `── man-ai：翻译失败（<原因>），以下为原文 ──`。
+- `-k` 路径没有尾行；页首行按 §5.4 使用两形态：`── man-ai: translated (<language>) ──` 或 `── man-ai: translation failed (<reason>), showing the original below ──`。
 
 ### 8.4 进度提示
 
 首个块写出（分页器尚未启动）期间，若 `isatty(1)`，向 stderr 写一行静态提示：
 
 ```text
-man-ai: 正在翻译（<目标语言>）…
+man-ai: translating (<language>)…
 ```
 
 不原地刷新、不显示百分比、不清除。分页器启动后不写 stderr。非 TTY 的 `--translate` 路径不写提示。
@@ -511,7 +511,7 @@ man-ai: 正在翻译（<目标语言>）…
 | 前三块不足一屏 | 按序写出直到行数达终端高度再启动 |
 | 首块慢、后续块快 | 后续块留在内存，等首块写出后按序补上；不得乱序 |
 | 首块失败 | 原文写出，继续后续块 |
-| 未配置后端 | 不提交任何请求，全部原文，尾行 `翻译失败（未配置），未完成部分为原文` |
+| 未配置后端 | 不提交任何请求，全部原文，尾行 `translation failed (not configured), remaining blocks left untranslated` |
 | 中途 429 | 该块退避 500ms 重试一次，仍失败按原文写出 |
 | 用户中途 `q` | 停止提交与写入，丢弃在途请求，透传退出码，无尾行 |
 | 非 TTY + `--translate` | 不起分页器、不写首尾行，按序写 stdout，成功静默 |
@@ -597,9 +597,9 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 | 值覆盖变量 | 无（除 `api_key_env` 指向的变量） |
 
 - 文件不存在 = 全部取默认值，静默。
-- TOML 语法错误：stderr 一行 `man-ai: 配置文件解析失败（<路径>），按默认值继续`，整个文件按缺失处理。
+- TOML 语法错误：stderr 一行 `man-ai: failed to parse config (<path>); using defaults`，整个文件按缺失处理。
 - 单个键类型不符、整数越界、URL 或代理无法解析：stderr 一行警告，该键按默认值继续。
-- 未知键：stderr 一行 `man-ai: 忽略未知配置项 <键>`，其余照常。
+- 未知键：stderr 一行 `man-ai: ignoring unknown config key <key>`，其余照常。
 - 目录与文件权限不做检查；密钥以明文存于该文件，文档写明这一点。
 - 任何配置问题都不阻止页面显示、不改变退出码。
 
@@ -629,8 +629,8 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 必填与合法性：
 
 - `endpoint`、`model` 始终必填。密钥仅对远端端点必填；endpoint 的 host 为 `localhost`、`127.0.0.1` 或 `::1` 时视为本地端点，密钥可空。
-- 缺任一必填项 → 状态「未配置」，整页回退原文，不发任何请求。
-- 类型不符、整数越界（`concurrency < 1`、`max_tokens ≤ 0`、`timeout_seconds ≤ 0`、`cache_max_mb < 0`）、`proxy` 或 endpoint 无法解析 → 警告，该键按默认值继续。必填缺失不属此类，不填就是「未配置」。
+- 缺任一必填项 → 状态「not configured」，整页回退原文，不发任何请求。
+- 类型不符、整数越界（`concurrency < 1`、`max_tokens ≤ 0`、`timeout_seconds ≤ 0`、`cache_max_mb < 0`）、`proxy` 或 endpoint 无法解析 → 警告，该键按默认值继续。必填缺失不属此类，不填就是「not configured」。
 
 示例：
 
@@ -683,26 +683,26 @@ HTTPS 用系统信任库（macOS Security framework、Linux ca-certificates）�
 
 | 情况 | 原因 | 停止提交新块 |
 |---|---|---|
-| `endpoint` / `model` / 远端密钥缺任一 | `未配置` | 是 |
-| DNS 失败、连接拒绝、TLS 校验失败（重试一次后仍失败） | `模型不可达` | 是 |
-| 单次尝试超时 | `超时` | 否，逐块 |
-| 400/401/403/404 及其它确定性 4xx | `后端返回错误` | 是 |
-| 429、5xx、空响应、`length` 截断、结构非法（重试一次后） | `后端返回错误` | 否，逐块 |
-| Ctrl-C | `用户中断` | 是 |
+| `endpoint` / `model` / 远端密钥缺任一 | `not configured` | 是 |
+| DNS 失败、连接拒绝、TLS 校验失败（重试一次后仍失败） | `model unreachable` | 是 |
+| 单次尝试超时 | `timeout` | 否，逐块 |
+| 400/401/403/404 及其它确定性 4xx | `backend error` | 是 |
+| 429、5xx、空响应、`length` 截断、结构非法（重试一次后） | `backend error` | 否，逐块 |
+| Ctrl-C | `interrupted` | 是 |
 
 ### 10.5 诊断与隐私
 
 用户可见文案只有三处：
 
-1. 页首行（TTY 分页器路径）：`── man-ai：译文（<目标语言>）──`。
+1. 页首行（TTY 分页器路径）：`── man-ai: translation (<language>) ──`。
 2. 尾行（§8.3）。
-3. 非 TTY 的 `--translate` 或 `-k` 整批失败：stderr 一行 `man-ai: 翻译失败（<原因>），以下为原文`。
+3. 非 TTY 的 `--translate` 或 `-k` 整批失败：stderr 一行 `man-ai: translation failed (<reason>), showing the original below`。
 
 诊断细节（每个进程最多一次，写 stderr，不含原文与密钥）：
 
-- 配置缺失：`man-ai: 未配置后端（缺少 <项>），本次不翻译`
-- HTTP 非 2xx：`man-ai: 后端返回 HTTP <状态码>`；响应体是 JSON 且含 `error.code` 或 `error.type` 时附上；**不写** `error.message`。
-- 401：`man-ai: 后端返回 HTTP 401，检查 api_key / api_key_env`。
+- 配置缺失：`man-ai: backend not configured (missing <item>); not translating`
+- HTTP 非 2xx：`man-ai: backend returned HTTP <status>`；响应体是 JSON 且含 `error.code` 或 `error.type` 时附上；**不写** `error.message`。
+- 401：`man-ai: backend returned HTTP 401; check api_key / api_key_env`。
 
 隐私边界：
 
@@ -732,7 +732,7 @@ HTTPS 用系统信任库（macOS Security framework、Linux ca-certificates）�
 
 - `--lang` 在 argv 任意位置出现，随自有参数一起剥离；同名多次出现时最后一个生效。
 - `--lang` 非法是用法错误，退出 2，不回退。
-- 配置 `lang` 非法：stderr 一行 `man-ai: 忽略非法的配置项 lang：<值>`，继续往下一来源走。
+- 配置 `lang` 非法：stderr 一行 `man-ai: ignoring invalid config key lang: <value>`，继续往下一来源走。
 - 环境值非法：静默跳过，尝试下一个环境变量。
 - `LANGUAGE` 不参与。
 
@@ -758,47 +758,47 @@ HTTPS 用系统信任库（macOS Security framework、Linux ca-certificates）�
 
 ### 11.4 显示名与提示词名
 
-提示词的 `{TARGET_LANGUAGE}` 与页首/尾行的 `<目标语言>` 都查这张精确匹配表。表外标签两者都用标签原文。不做前缀回退，不合并同义词。
+提示词的 `{TARGET_LANGUAGE}` 与页首/尾行的 `<language>` 都查这张精确匹配表，两者都使用英文名。表外标签两者都用标签原文。不做前缀回退，不合并同义词。
 
-| 标签 | 显示名 | 提示词用英文名 |
-|---|---|---|
-| `zh-CN` | 简体中文 | Simplified Chinese |
-| `zh-SG` | 简体中文（新加坡） | Simplified Chinese (Singapore) |
-| `zh-Hans` | 简体中文 | Simplified Chinese |
-| `zh-TW` | 繁體中文 | Traditional Chinese |
-| `zh-HK` | 繁體中文（香港） | Traditional Chinese (Hong Kong) |
-| `zh-Hant` | 繁體中文 | Traditional Chinese |
-| `ja` | 日本語 | Japanese |
-| `ko` | 한국어 | Korean |
-| `en` | 英语 | English |
-| `fr` | français | French |
-| `de` | Deutsch | German |
-| `es` | español | Spanish |
-| `pt` | 葡萄牙语 | Portuguese |
-| `pt-BR` | português (Brasil) | Brazilian Portuguese |
-| `pt-PT` | português (Portugal) | European Portuguese |
-| `ru` | русский | Russian |
-| `it` | italiano | Italian |
-| `nl` | Nederlands | Dutch |
-| `pl` | polski | Polish |
-| `tr` | Türkçe | Turkish |
-| `uk` | українська | Ukrainian |
-| `vi` | Tiếng Việt | Vietnamese |
-| `th` | ไทย | Thai |
-| `id` | Bahasa Indonesia | Indonesian |
-| `ms` | Bahasa Melayu | Malay |
-| `ar` | العربية | Arabic |
-| `he` | עברית | Hebrew |
-| `fa` | فارسی | Persian |
-| `hi` | हिन्दी | Hindi |
-| `cs` | čeština | Czech |
-| `sv` | svenska | Swedish |
-| `da` | dansk | Danish |
-| `fi` | suomi | Finnish |
-| `nb` | norsk bokmål | Norwegian Bokmål |
-| `el` | Ελληνικά | Greek |
-| `hu` | magyar | Hungarian |
-| `ro` | română | Romanian |
+| 标签 | 英文名 |
+|---|---|
+| `zh-CN` | Simplified Chinese |
+| `zh-SG` | Simplified Chinese (Singapore) |
+| `zh-Hans` | Simplified Chinese |
+| `zh-TW` | Traditional Chinese |
+| `zh-HK` | Traditional Chinese (Hong Kong) |
+| `zh-Hant` | Traditional Chinese |
+| `ja` | Japanese |
+| `ko` | Korean |
+| `en` | English |
+| `fr` | French |
+| `de` | German |
+| `es` | Spanish |
+| `pt` | Portuguese |
+| `pt-BR` | Brazilian Portuguese |
+| `pt-PT` | European Portuguese |
+| `ru` | Russian |
+| `it` | Italian |
+| `nl` | Dutch |
+| `pl` | Polish |
+| `tr` | Turkish |
+| `uk` | Ukrainian |
+| `vi` | Vietnamese |
+| `th` | Thai |
+| `id` | Indonesian |
+| `ms` | Malay |
+| `ar` | Arabic |
+| `he` | Hebrew |
+| `fa` | Persian |
+| `hi` | Hindi |
+| `cs` | Czech |
+| `sv` | Swedish |
+| `da` | Danish |
+| `fi` | Finnish |
+| `nb` | Norwegian Bokmål |
+| `el` | Greek |
+| `hu` | Hungarian |
+| `ro` | Romanian |
 
 - `en` 行只为完整性存在：目标语言为 `en` 时永远不进入提示词或页首行。
 - 表是静态数据，加行不递增 `PROMPT_VERSION`；改已有行的英文名才递增。
@@ -860,7 +860,7 @@ HTTPS 用系统信任库（macOS Security framework、Linux ca-certificates）�
 
 ### 12.4 首次运行、升级与卸载
 
-- 不引导、不生成配置、不交互。无配置或必填缺失时整页回退原文，页首行 `翻译失败（未配置）`。
+- 不引导、不生成配置、不交互。无配置或必填缺失时整页回退原文，页首行 `translation failed (not configured)`。
 - 不提供 `--init`；文档给可直接复制的 TOML 模板与每个键的说明。
 - 配置目录与缓存目录按需创建，安装器不创建。
 - 不做自更新，不做启动时版本检查。升级只有 `cargo install` 重跑、`brew upgrade man-ai`、重新下载 tarball 三条路。
@@ -915,7 +915,7 @@ v1 不签名、不公证：
 
 - 每块一次请求；请求体逐字节包含该块原文；请求数 = 块数。
 - `concurrency=4` 下写出顺序仍 = 块序。
-- 首行 `译文（<语言>）`、尾行计数存在。
+- 首行 `── man-ai: translation (<language>) ──`、尾行计数存在。
 - 每写出一个块立即 flush。
 - 结构校验：假服务返回孤悬退格、非法 SGR、字面 `ESC[` 时，该块回退原文、不丢弃、不半截写入，尾行计数进失败，该块不入缓存。
 - 块切分与重组：切分再合并 == 原文逐字节；块数 == 按空行切分的结果；写出顺序 == 输入顺序。假服务原样回显块（原样回显不算失败，见 §7.5）。
@@ -957,7 +957,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 |---|---|---|
 | CLI 解析 | 手写（约 40 行） | 未知参数与 `--` 之后必须按原序原样交回 man；clap 会在未知参数上报错或吞进匹配分支，保不住原序 |
 | 内层分页器拆词 | 手写（约 30 行） | 契约只是空白、引号、反斜杠；不引入 shell 解析库 |
-| HTTP 客户端 | `async-openai 0.43`（`chat-completion` + `rustls`） | 复用 OpenAI 兼容请求/响应类型；异步且无内置重试，错误带原始 status 与 `error.code` |
+| HTTP 客户端 | `async-openai 0.43`（`chat-completion` + `rustls` + `middleware`） | 复用 OpenAI 兼容请求/响应类型；用 `with_http_service(ReqwestService)` 绕过库内置重试，错误带原始 status 与 `error.code` |
 | HTTP 传输 | `reqwest 0.13`（`rustls` + `socks`） | 构造带单次超时与显式代理的 Client；系统信任库 |
 | 并发 | `tokio 1`（`rt-multi-thread`）+ `futures 0.3` | `buffered(concurrency)` 同时给出在途上限与按块序产出 |
 | 配置 | `toml` + `serde` + `serde_ignored` | 未知键告警；逐键校验由契约代码负责 |
@@ -971,7 +971,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 | pty 测试 | `portable-pty`（dev-dependency） | 跨平台开 pty、设 winsize |
 | 许可审计 | `cargo-deny` | 拒绝 GPL/AGPL/SSPL，与 MIT 分发一致 |
 
-版本策略：提交 `Cargo.lock`；`rust-version = "1.85"` + edition 2024；CI 跑 `cargo-deny check licenses advisories`。`async-openai` 锁 `0.43.x`，升级是显式动作。`max_tokens` 字段在 0.43 标注 deprecated，按契约使用时加 `#[allow(deprecated)]`，线格式仍是 `max_tokens`。`rustls` 默认加密后端为 `aws-lc-rs`，需要 C 编译；`cargo-deny` 允许清单包含 ISC。
+版本策略：提交 `Cargo.lock`；`rust-version = "1.85"` + edition 2024；CI 跑 `cargo-deny check licenses advisories`。`async-openai` 锁 `0.43.x`，升级是显式动作；`middleware` feature 只用于安装无重试的 `ReqwestService`。`max_tokens` 字段在 0.43 标注 deprecated，按契约使用时加 `#[allow(deprecated)]`，线格式仍是 `max_tokens`。`rustls` 默认加密后端为 `aws-lc-rs`，需要 C 编译；`cargo-deny` 允许清单包含 ISC。
 
 ## 15. 已知限制
 

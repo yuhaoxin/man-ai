@@ -25,8 +25,8 @@
 - `http://` 与 `https://` 都接受；HTTPS 只信系统信任库，不提供跳过校验的开关，不支持自签证书与 Azure 专有认证。
 - 显式 `proxy` 完全取代标准代理变量；未设置时由 HTTP 客户端读取 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`。
 - 每次尝试有单次超时（默认 30 秒）；连接失败、DNS 失败、5xx、429 重试一次、间隔 500ms；超时与确定性 4xx 不重试。
-- 失败原因固定五项：`未配置`、`模型不可达`、`超时`、`后端返回错误`、`用户中断`。诊断只写状态码与 `error.code`/`error.type`，不写 `error.message` 与原文。
-- 实现复用 `async-openai 0.43`（`chat-completion` + `rustls`），用 `reqwest 0.13` 构造带超时与代理的 Client；重试包装自写。
+- 失败原因固定五项：`not configured`、`model unreachable`、`timeout`、`backend error`、`interrupted`。诊断只写状态码与 `error.code`/`error.type`，不写 `error.message` 与原文。
+- 实现复用 `async-openai 0.43`（`chat-completion` + `rustls` + `middleware`），用 `reqwest 0.13` 构造带超时与代理的 Client；`with_http_service(ReqwestService)` 跳过库内置的 3 次重试，重试包装自写。
 
 ## 后果
 
