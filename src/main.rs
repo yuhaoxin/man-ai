@@ -5,7 +5,8 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::exit;
 
-use man_ai::{cli, language, pager, shellmode};
+use man_ai::language::Language;
+use man_ai::{cli, config, pager, shellmode};
 
 const HELP: &str = "\
 Usage: man-ai [--lang <tag>] [--translate | --no-translate] [man arguments...]
@@ -47,23 +48,23 @@ fn main() {
     };
 
     let code = if io::stdin().is_terminal() {
-        shellmode::run(&own, lang.as_deref())
+        shellmode::run(&own, lang.as_ref().map(Language::tag))
     } else {
-        pager_mode(&own)
+        pager_mode(&own, lang)
     };
     exit(code);
 }
 
 /// `--lang` 缺值、空值与形状非法都是用法错误，退出 2（§4.4、§11.6）。
-fn resolve_lang(own: &cli::OwnArgs) -> Result<Option<String>, i32> {
+fn resolve_lang(own: &cli::OwnArgs) -> Result<Option<Language>, i32> {
     if let Some(message) = &own.lang_error {
         eprintln!("man-ai: {message}");
         return Err(2);
     }
     match own.lang.as_deref() {
         None => Ok(None),
-        Some(raw) => match language::cli_tag(raw) {
-            Ok(tag) => Ok(Some(tag)),
+        Some(raw) => match Language::parse_cli(raw) {
+            Ok(lang) => Ok(Some(lang)),
             Err(message) => {
                 eprintln!("man-ai: {message}");
                 Err(2)
@@ -72,13 +73,26 @@ fn resolve_lang(own: &cli::OwnArgs) -> Result<Option<String>, i32> {
     }
 }
 
-/// 分页器模式：读完 stdin 再决定输出路径（§5.2）。
+/// 分页器模式：先解析配置与语言并输出告警，再读完 stdin 决定输出路径（§5.2）。
 ///
-/// 本票不翻译，原文按内层分页器链或 stdout 输出。切块、页首行/尾行与
-/// 翻译路径由后续票接入。
-fn pager_mode(own: &cli::OwnArgs) -> i32 {
+/// 本票没有翻译路径，原文按内层分页器链或 stdout 输出。
+fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
+    let loaded = config::load(config::config_path().as_deref());
+    for warning in &loaded.warnings {
+        eprintln!("{warning}");
+    }
+    let config_lang = loaded
+        .config
+        .lang
+        .as_deref()
+        .and_then(Language::from_config);
+    let lang = Language::resolve(cli_lang, config_lang);
+
     let mut input = Vec::new();
     let _ = io::stdin().read_to_end(&mut input);
+
+    // #20 在这个判定为真时接翻译链路；眼下两条路径都原文直通。
+    let _translate = !lang.is_english() && own.translate != Some(false);
 
     if io::stdout().is_terminal() {
         if let Some(chain) = pager::resolve() {
