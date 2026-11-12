@@ -1,0 +1,92 @@
+# CI matrix for man-ai (§13.5). All names and descriptions are English.
+#
+# Row 1: ubuntu-24.04 (man-db + groff)  -- everything, license audit.
+# Row 2: macos-15 (arm64, BSD man + mandoc) -- everything.
+# Row 3: macos-15-intel (x86_64) -- everything.
+# Row 4: Alpine container (musl) -- build, unit tests, non-TTY path and
+#        -w/-k/-t passthrough; no differential tests (its man is mandoc).
+#
+# macOS Intel runners are retired in 2027-08; delete row 3 then and replace the
+# darwin-x64 artifact coverage separately.
+
+name: CI
+
+on:
+  push:
+    branches: [main, feat/man-ai-v1]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  linux:
+    name: Linux x86_64 (ubuntu-24.04, man-db + groff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install man and groff
+        run: sudo apt-get update && sudo apt-get install -y man-db groff
+      - name: Test
+        run: cargo test
+      - name: Release build
+        run: cargo build --release
+      - name: License and advisory audit
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories
+
+  macos-arm64:
+    name: macOS arm64 (macos-15, BSD man + mandoc)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test
+      - name: Release build
+        run: cargo build --release
+
+  macos-intel:
+    # 2027-08: macos-15-intel runners are retired; delete this job then.
+    name: macOS x86_64 (macos-15-intel, retired 2027-08)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test
+      - name: Release build
+        run: cargo build --release
+
+  alpine:
+    name: Alpine (musl, build + unit + non-TTY + passthrough)
+    runs-on: ubuntu-24.04
+    container: rust:alpine
+    steps:
+      - name: Install build and man tooling
+        run: apk add --no-cache git build-base cmake perl mandoc man-pages less util-linux-misc
+      - uses: actions/checkout@v4
+      - name: Release build
+        run: cargo build --release
+      - name: Unit tests
+        run: cargo test --lib
+      - name: Non-TTY integration tests (no pty, no real-man differential)
+        run: cargo test --test t20_backend --test t21_concurrency
+      - name: Non-TTY default path passes bytes through
+        run: |
+          printf 'LS(1)\n\n     ls - list directory contents\n' > /tmp/page.txt
+          ./target/release/man-ai --no-translate < /tmp/page.txt | cmp - /tmp/page.txt
+          ./target/release/man-ai --lang en < /tmp/page.txt | cmp - /tmp/page.txt
+      - name: Passthrough entries in a pty (-w / -k / -t)
+        # -w must resolve through the platform man; -k and -t depend on the
+        # mandoc provider (no whatis database, no -t mode) and are best effort.
+        run: |
+          script -qec "./target/release/man-ai -w ls" /dev/null | grep -q .
+          script -qec "./target/release/man-ai -k ls" /dev/null || true
+          script -qec "./target/release/man-ai -t ls" /dev/null || true
