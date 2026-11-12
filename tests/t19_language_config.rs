@@ -162,10 +162,7 @@ fn lang_最后一个生效且附加的是规范标签() {
     let dir = TempDir::new("last-wins");
     let run = run_shell(&dir, "--lang zh_CN.UTF-8 --lang pt_br", &[]);
     assert_eq!(run.code, 0);
-    assert_eq!(
-        record_value(&run.record, "MANPAGER"),
-        "man-ai --lang pt-BR"
-    );
+    assert_eq!(record_value(&run.record, "MANPAGER"), "man-ai --lang pt-BR");
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }
 
@@ -210,7 +207,10 @@ fn 薄壳模式不读配置也不附加配置语言() {
 #[test]
 fn 分页器模式把配置告警写到_stderr_并原文直通() {
     let dir = TempDir::new("config-warn");
-    write_config(&dir, "colour = \"blue\"\nendpoint = \"ftp://example.com\"\n");
+    write_config(
+        &dir,
+        "colour = \"blue\"\nendpoint = \"ftp://example.com\"\n",
+    );
     let page: &[u8] = b"LS(1)\n\n     ls - list\n";
     let out = run(&["--lang", "zh-CN"], &dir, &[], page);
     assert_eq!(out.status.code(), Some(0));
