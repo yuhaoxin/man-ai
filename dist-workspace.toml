@@ -1,0 +1,31 @@
+# cargo-dist configuration for man-ai (English descriptions only).
+#
+# Release artifacts are exactly one archive per target plus its .sha256:
+# man-ai-<version>-<target>.tar.gz and man-ai-<version>-<target>.tar.gz.sha256.
+# No shell completions, no man page, no source tarball, and no README/LICENSE
+# copied into the archive: the archive contains only the man-ai binary.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.34.0"
+ci = "github"
+# .tar.gz is required by docs/install.md and §12.1; the default would be .tar.xz.
+unix-archive = ".tar.gz"
+# Only the Homebrew tap is published; the tap wraps the same release tarballs.
+installers = ["homebrew"]
+tap = "yuhaoxin/homebrew-tap"
+publish-jobs = ["homebrew"]
+# Keep archives to the binary alone.
+auto-includes = false
+source-tarball = false
+# man-ai has no self-updater and no startup version check (§12.4).
+install-updater = false
+pr-run-mode = "skip"
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+]

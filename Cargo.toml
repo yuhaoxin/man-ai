@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "Translate rendered man pages into a target language"
+repository = "https://github.com/yuhaoxin/man-ai"
+homepage = "https://github.com/yuhaoxin/man-ai"
+readme = "README.md"
 
 [dependencies]
 async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "rustls", "middleware"] }
