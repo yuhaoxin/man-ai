@@ -20,8 +20,8 @@ cargo deny check licenses advisories
 
 ```sh
 # Requires cargo-dist (0.34.x). The config lives in dist-workspace.toml.
-# First release only: `cargo dist init` generates .github/workflows/release.yml
-# from this config (that file is not committed yet).
+# .github/workflows/release.yml is generated from this config and committed;
+# after changing dist-workspace.toml run `dist generate` and commit the diff.
 cargo dist plan
 cargo dist build --artifacts=local
 ```
