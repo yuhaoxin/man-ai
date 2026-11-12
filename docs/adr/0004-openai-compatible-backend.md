@@ -20,6 +20,7 @@
 采用方案 3。
 
 - 固定 `POST {endpoint}/chat/completions`，`Authorization: Bearer <key>`；不自动补 `/v1`、不剥路径，只去掉尾部 `/`。
+- 响应只取 `choices[0].message.content`；reasoning/thinking 字段一律忽略，不展示、不入缓存、不写诊断。
 - `temperature=0`、`stream=false` 固定；`max_tokens` 可选，字段名保持 `max_tokens`。
 - 无内置默认端点；`endpoint`、`model` 必填，远端端点还必须有密钥。密钥只来自配置文件 `api_key` 或 `api_key_env` 指向的变量。
 - `http://` 与 `https://` 都接受；HTTPS 只信系统信任库，不提供跳过校验的开关，不支持自签证书与 Azure 专有认证。

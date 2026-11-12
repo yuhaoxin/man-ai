@@ -369,6 +369,7 @@ option flags and file names byte-for-byte. Output only the JSON array.
 ### 7.4 返回协议
 
 - 响应正文即译文，原样使用；不重排、不折行、不截断、不改样式。
+- 响应中的 reasoning/thinking 类字段（如 `reasoning_content`）一律忽略：不展示、不写缓存、不写诊断；只使用 `choices[0].message.content`。content 为空即失败。
 - 允许的加工只有两种：
   1. 整个响应恰好是一个 Markdown 围栏块（以 ``` 开头、以 ``` 结尾，可带语言标记），且围栏内不含反引号时，剥掉首尾围栏行。
   2. 剥掉首尾纯空行；行内与行尾空格保留（可能是排版）。
@@ -580,6 +581,7 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 ### 9.6 隐私与开关
 
 - 只存译文，不存原文；键是 128 位哈希，不能反推内容。
+- 缓存内容只来自 `choices[0].message.content` 经 §7.4 加工后的译文；模型返回的思考/推理字段与其它响应字段不落盘。
 - `cache_enabled` 默认 `true`；为 `false` 时不读不写、不创建目录。
 - 缓存路径不按语言或端点分目录，不暴露配置。
 
