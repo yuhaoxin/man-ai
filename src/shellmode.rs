@@ -13,7 +13,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::language::Language;
 use crate::translate::PipelineCtx;
-use crate::{blocks, cli, config, output, pager, translate};
+use crate::{blocks, cli, config, klist, output, pager, translate};
 
 /// `-P` 让路时写到 stderr 的一行（§4.3）。程序输出一律英文。
 pub const PAGER_OVERRIDE_NOTE: &str = "man-ai: -P overrides MANPAGER; not translating";
@@ -30,8 +30,30 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
     if scan.passthrough {
         return exec_man(&own.rest);
     }
-    // §5.3：非 TTY 的 --translate 捕获 man 输出后翻译。-k/-f 拦截留给 #23。
-    if own.translate == Some(true) && !scan.kf && !io::stdout().is_terminal() {
+    // §5.4：命中 `-k`/`-f` 时拦截；`--no-translate`、en 与「非 TTY 且无 --translate」除外。
+    let stdout_tty = io::stdout().is_terminal();
+    if scan.kf && own.translate != Some(false) && (stdout_tty || own.translate == Some(true)) {
+        let loaded = config::load(config::config_path().as_deref());
+        let cli_lang = lang.and_then(|raw| Language::parse_cli(raw).ok());
+        let config_lang = loaded
+            .config
+            .lang
+            .as_deref()
+            .and_then(Language::from_config);
+        let language = Language::resolve(cli_lang, config_lang);
+        // §11.3：en 不拦截、不设 MANPAGER、不写 stderr。
+        if language.is_english() {
+            return exec_man(&own.rest);
+        }
+        for warning in &loaded.warnings {
+            eprintln!("{warning}");
+        }
+        // 用户原有的 MANPAGER 仍是 -k 结果的内层分页器（§5.5）。
+        save_manpager();
+        return klist::run(&own.rest, &language, &loaded.config, stdout_tty);
+    }
+    // §5.3：非 TTY 的 --translate 捕获 man 输出后翻译。
+    if own.translate == Some(true) && !io::stdout().is_terminal() {
         let loaded = config::load(config::config_path().as_deref());
         let cli_lang = lang.and_then(|raw| Language::parse_cli(raw).ok());
         let config_lang = loaded

@@ -210,6 +210,24 @@ fn strip_carriage_returns(bytes: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// 薄壳模式 + stdout 是 TTY：stdin/stdout 都在 pty 上，stderr 重定向到文件。
+pub fn run_shell_tty(dir: &TempDir, args: &[&str], extra_env: &[(&str, &str)]) -> PtyRun {
+    let stderr_file = dir.file("stderr.txt");
+    let mut script = String::from("exec ");
+    script.push_str(&sh_quote(BIN));
+    for arg in args {
+        script.push(' ');
+        script.push_str(&sh_quote(arg));
+    }
+    script.push_str(&format!(" 2>{}", sh_quote(stderr_file.to_str().unwrap())));
+    let run = run_pty_script(dir, &script, extra_env);
+    PtyRun {
+        output: strip_carriage_returns(run.output),
+        stderr: fs::read_to_string(&stderr_file).unwrap_or_default(),
+        code: run.code,
+    }
+}
+
 /// 薄壳模式 + stdout 非 TTY：stdin 是 pty，stdout/stderr 重定向到文件。
 pub fn run_shell_capture(dir: &TempDir, args: &[&str], extra_env: &[(&str, &str)]) -> PtyRun {
     let stdout_file = dir.file("stdout.txt");
@@ -337,6 +355,22 @@ pub fn fake_man(dir: &TempDir, page: &[u8], code: i32) -> PathBuf {
         &dir.file("man"),
         &format!(
             "#!/bin/sh\nprintf '%s' \"${{MANPAGER-<unset>}}\" > '{}'\ncat '{}'\nexit {code}\n",
+            record.display(),
+            fixture.display()
+        ),
+    );
+    record
+}
+
+/// 写一个假 `man -k`：输出结果行，并把收到的 `WHATISPAGER` 记录到 `whatispager-record.txt`。
+pub fn fake_kman(dir: &TempDir, output: &[u8], code: i32) -> PathBuf {
+    let fixture = dir.file("kpage.bin");
+    fs::write(&fixture, output).unwrap();
+    let record = dir.file("whatispager-record.txt");
+    write_script(
+        &dir.file("man"),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"${{WHATISPAGER-<unset>}}\" > '{}'\n/bin/cat '{}'\nexit {code}\n",
             record.display(),
             fixture.display()
         ),
