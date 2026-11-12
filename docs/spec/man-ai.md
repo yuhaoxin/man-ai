@@ -833,7 +833,7 @@ HTTPS 用系统信任库（macOS Security framework、Linux ca-certificates）�
 | 渠道 | 命令 | 定位 |
 |---|---|---|
 | cargo | `cargo install man-ai`（或 `--git` / `--path`） | 开发者与已有 Rust 工具链的用户 |
-| GitHub Release | `man-ai-<version>-<target>.tar.gz` + `.sha256` | 事实来源，无需工具链 |
+| GitHub Release | `man-ai-<target>.tar.gz` + `.sha256`（版本由 tag 区分） | 事实来源，无需工具链 |
 | Homebrew tap | `brew install yuhaoxin/tap/man-ai` | 便利层，包装同一份 Release tarball（`url` + `sha256`，不自建 bottle） |
 
 目标三元组：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`aarch64-unknown-linux-gnu`、`x86_64-unknown-linux-gnu`。Release 资产由 cargo-dist 生成。tap 的 formula 名与二进制名一致，不提供 `man` 名下的 formula。

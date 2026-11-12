@@ -26,6 +26,6 @@ toml = "1.2.1"
 axum = "0.8.9"
 portable-pty = "0.9.0"
 
-# cargo-dist builds artifacts with this profile (see dist-workspace.toml).
+# cargo-dist 用这个 profile 构建产物（见 dist-workspace.toml）。
 [profile.dist]
 inherits = "release"

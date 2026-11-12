@@ -1,10 +1,9 @@
-# Homebrew formula template for the tap yuhaoxin/homebrew-tap.
+# tap yuhaoxin/homebrew-tap 的 Homebrew formula 模板。
 #
-# cargo-dist writes its own generated formula into the tap on release, filling
-# in the version and the two per-target sha256 values; this file documents the
-# expected shape and is the copy to use when the tap is bootstrapped by hand.
-# Replace VERSION, ARM64_SHA256 and X86_64_SHA256 with the values from the
-# release assets. No bottle is published: the formula wraps the release tarball.
+# 发布时 cargo-dist 会把自己的 formula 写进 tap，填入版本与两个 target 的
+# sha256；本文件说明期望形态，也是手工初始化 tap 时的副本。把 VERSION、
+# ARM64_SHA256、X86_64_SHA256 换成 release 资产里的值。不发布 bottle：
+# formula 直接引用 release tarball。
 class ManAi < Formula
   desc "Translate rendered man pages into a target language"
   homepage "https://github.com/yuhaoxin/man-ai"

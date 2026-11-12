@@ -1,7 +1,8 @@
 # cargo-dist configuration for man-ai (English descriptions only).
 #
 # Release artifacts are exactly one archive per target plus its .sha256:
-# man-ai-<version>-<target>.tar.gz and man-ai-<version>-<target>.tar.gz.sha256.
+# man-ai-<target>.tar.gz and man-ai-<target>.tar.gz.sha256; the version is
+# carried by the release tag, as cargo-dist names archives without it.
 # No shell completions, no man page, no source tarball, and no README/LICENSE
 # copied into the archive: the archive contains only the man-ai binary.
 

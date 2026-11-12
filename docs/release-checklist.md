@@ -5,7 +5,7 @@
 ## 1. 版本与提交
 
 ```sh
-# Bump [package] version in Cargo.toml, then refresh the lockfile.
+# 改 Cargo.toml 里的 [package] version，然后刷新 lockfile。
 cargo update -p man-ai
 cargo fmt --check
 cargo test
@@ -19,14 +19,14 @@ cargo deny check licenses advisories
 ## 2. 打包产物核对
 
 ```sh
-# Requires cargo-dist (0.34.x). The config lives in dist-workspace.toml.
-# .github/workflows/release.yml is generated from this config and committed;
-# after changing dist-workspace.toml run `dist generate` and commit the diff.
+# 需要 cargo-dist（0.34.x）；配置在 dist-workspace.toml。
+# .github/workflows/release.yml 由该配置生成并入库；
+# 改过 dist-workspace.toml 后跑 `dist generate` 并提交 diff。
 cargo dist plan
 cargo dist build --artifacts=local
 ```
 
-`cargo dist plan` 应列出且只列出四个 target 的 `<app>-<target>.tar.gz` 与 `.sha256`：
+`cargo dist plan` 应列出且只列出四个 target 的 `man-ai-<target>.tar.gz` 与 `.sha256`：
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
@@ -37,7 +37,7 @@ cargo dist build --artifacts=local
 
 ```sh
 tar -tzf man-ai-<target>.tar.gz
-shasum -a 256 -c man-ai-<target>.tar.gz.sha256   # Linux: sha256sum -c
+shasum -a 256 -c man-ai-<target>.tar.gz.sha256   # Linux 用 sha256sum -c
 ```
 
 ## 3. 发布与 tap
@@ -65,7 +65,7 @@ shasum -a 256 -c man-ai-<target>.tar.gz.sha256   # Linux: sha256sum -c
 | 1 | `ubuntu-24.04` | `cargo test`、`cargo build --release`、`cargo-deny check licenses advisories` |
 | 2 | `macos-15`（arm64） | `cargo test`、`cargo build --release` |
 | 3 | `macos-15-intel` | 同上；2027-08 runner 退役时删除该行 |
-| 4 | Alpine 容器（musl） | 构建、单元测试、非 TTY 路径、`-w`/`-k`/`-t` 透传；不做差分 |
+| 4 | Alpine 容器（musl） | 构建、单元测试、非 TTY 路径、`-w`/`-k`/`-t` 与平台 man 的透传对比；不做差分 |
 
 Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。四行全绿才可发布。
 
@@ -88,7 +88,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。�
 ## 6. 发布后抽查
 
 ```sh
-# Fresh machine or clean PATH:
+# 新机器，或干净的 PATH：
 curl -fLO .../man-ai-<target>.tar.gz
 shasum -a 256 -c man-ai-<target>.tar.gz.sha256
 tar -xzf man-ai-<target>.tar.gz
