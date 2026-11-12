@@ -164,6 +164,29 @@ fn http_429_重试一次后成功() {
 }
 
 #[test]
+fn http_429_重试一次后仍失败则回退该块() {
+    let model = FakeModel::start(vec![
+        Reply::Status(429, error_body("rate_limit_exceeded", "requests")),
+        Reply::Status(429, error_body("rate_limit_exceeded", "requests")),
+    ]);
+    let dir = TempDir::new("http-429-fail");
+    dir.write_config(&model_config(&model, ""));
+    let run = translate(&dir, b"block\n");
+    assert_eq!(run.stdout, b"block\n");
+    assert_eq!(model.count(), 2, "429 只重试一次");
+    let stderr = text(&run.stderr);
+    assert_eq!(
+        stderr.matches("backend returned HTTP 429").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("man-ai: translation failed (backend error), showing the original below"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn http_500_重试一次后仍失败则回退该块() {
     let model = FakeModel::start(vec![
         Reply::Status(500, error_body("server_error", "api_error")),
