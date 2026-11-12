@@ -21,7 +21,7 @@
 
 - 固定 `POST {endpoint}/chat/completions`，`Authorization: Bearer <key>`；不自动补 `/v1`、不剥路径，只去掉尾部 `/`。
 - 响应只取 `choices[0].message.content`；reasoning/thinking 字段一律忽略，不展示、不入缓存、不写诊断。
-- `temperature=0`、`stream=false` 固定；`max_tokens` 可选，字段名保持 `max_tokens`。
+- `temperature=0`、`stream=false` 固定；`reasoning_effort` 可配置，默认 `low`，配置为空时不发送；`max_tokens` 可选，字段名保持 `max_tokens`。
 - 无内置默认端点；`endpoint`、`model` 必填，远端端点还必须有密钥。密钥只来自配置文件 `api_key` 或 `api_key_env` 指向的变量。
 - `http://` 与 `https://` 都接受；HTTPS 只信系统信任库，不提供跳过校验的开关，不支持自签证书与 Azure 专有认证。
 - 显式 `proxy` 完全取代标准代理变量；未设置时由 HTTP 客户端读取 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`。
@@ -36,4 +36,4 @@
 - 错误映射绑定 `async-openai` 的错误类型；`0.43.x` 升级需要重新核对状态码、`error.code` 与 `max_tokens` 字段。
 - 没有单页成本上限与按 token 计价；成本只能靠缓存、`concurrency`、`max_tokens` 间接约束。
 - 不支持系统钥匙串、自定义 CA、Azure `api-key` 头与 `api-version` 查询参数。
-- 请求参数固定使缓存键稳定；任何固定参数变化都必须递增 `PROMPT_VERSION`。
+- 请求参数固定使缓存键稳定；固定参数（提示词、`temperature`、`stream`）变化必须递增 `PROMPT_VERSION`，用户可配的 `reasoning_effort` 直接进入缓存键。

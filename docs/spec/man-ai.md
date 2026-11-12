@@ -525,15 +525,16 @@ man-ai: translating (<language>)…
 各字段按 UTF-8 字节拼接，每段前置 8 字节小端长度，字段顺序固定：
 
 ```text
-CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端点规范化 URL | 模型名 | 输入字节
+CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端点规范化 URL | 模型名 | 思考强度 | 输入字节
 ```
 
 - 键 = BLAKE3-128 摘要，写作 32 位小写十六进制。
-- `CACHE_VERSION = 1`：回写协议、校验语义、键结构任一变化即递增。
+- `CACHE_VERSION = 2`：回写协议、校验语义、键结构任一变化即递增。
 - `PROMPT_VERSION = 2`：提示词模板、`temperature`、`stream` 变更时递增。`max_tokens` 是用户配置项，不入键、不触发递增：取值足够大时成功译文逐字节相同，取值过小则请求失败，失败不入缓存。
 - 形态标签：`page`（整页块）或 `k`（`-k`/`-f` 描述批），两者互不命中。
 - 目标语言：§11 的规范标签，只用规范形式。
 - 端点规范化：scheme 与 host 转小写、去默认端口（http 80、https 443）、去尾部 `/`，保留路径；查询串与片段不参与请求构造，含查询串或片段的 endpoint 按配置错误处理。模型名按配置原样（大小写敏感）。
+- 思考强度：配置为空写 `off`，否则写 `reasoning_effort` 的小写取值；它影响模型输出，因此入键。
 - 输入字节：`page` 用块的 `raw`（UTF-8 解码前）；`k` 用 §7.6 的 JSON 数组序列化字节。
 - **不含**：页面路径、section、mtime/size、工具版本号、并发度、终端宽度、`max_tokens`、页首行与尾行。
 
@@ -563,6 +564,7 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 | man 页 mtime 变、内容不变 | 否 | mtime 不入键 |
 | 目标语言变更 | 是 | 键字段 |
 | 端点或模型切换 | 是 | 键字段 |
+| 思考强度变更 | 是 | 键字段 |
 | 提示词或固定请求参数改版 | 是 | `PROMPT_VERSION++` |
 | 回写/校验语义变更 | 是 | `CACHE_VERSION++` |
 | 工具版本升级（不改变上述语义） | 否 | 版本号不入键 |
@@ -612,6 +614,7 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 | `lang` | string | 空 | 目标语言 BCP-47 标签；空 = 回落到环境 |
 | `endpoint` | string | 无（必填） | 完整 URL，含 `/v1` 之类前缀；只接受 http/https，不含查询串与片段 |
 | `model` | string | 无（必填） | 请求体 `model` 字段；只从配置文件读，无 CLI 覆盖 |
+| `reasoning_effort` | string | `"low"` | 请求体 `reasoning_effort`；`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`，空 = 不发送 |
 | `api_key` | string | 空 | 直接写的密钥，优先于 `api_key_env` |
 | `api_key_env` | string | 空 | 环境变量名，取值时读它 |
 | `max_tokens` | integer | 空（不发送） | 正整数 |
@@ -632,7 +635,8 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 
 - `endpoint`、`model` 始终必填。密钥仅对远端端点必填；endpoint 的 host 为 `localhost`、`127.0.0.1` 或 `::1` 时视为本地端点，密钥可空。
 - 缺任一必填项 → 状态「not configured」，整页回退原文，不发任何请求。
-- 类型不符、整数越界（`concurrency < 1`、`max_tokens ≤ 0`、`timeout_seconds ≤ 0`、`cache_max_mb < 0`）、`proxy` 或 endpoint 无法解析 → 警告，该键按默认值继续。必填缺失不属此类，不填就是「not configured」。
+- 类型不符、整数越界（`concurrency < 1`、`max_tokens ≤ 0`、`timeout_seconds ≤ 0`、`cache_max_mb < 0`）、`reasoning_effort` 取值无法识别、`proxy` 或 endpoint 无法解析 → 警告，该键按默认值继续。必填缺失不属此类，不填就是「not configured」。
+- `reasoning_effort` 默认发送 `low`；端点不支持该字段时请求会失败并按 §10.4 回退，此时把它设为空字符串即可完全不发送。
 
 示例：
 
@@ -640,6 +644,7 @@ CACHE_VERSION | PROMPT_VERSION | 形态标签 | 目标语言规范标签 | 端�
 lang = "zh-CN"
 endpoint = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
+reasoning_effort = "low"
 api_key_env = "DEEPSEEK_API_KEY"
 timeout_seconds = 30
 concurrency = 4
@@ -666,11 +671,13 @@ Authorization: Bearer <key>
     {"role": "user", "content": "<块原文 / -k 的 JSON 数组>"}
   ],
   "temperature": 0,
+  "reasoning_effort": "low",
   "stream": false
 }
 ```
 
 - `temperature`、`stream` 固定，不暴露配置项。`stream=false` 是刻意的：§8 的流式是 man-ai 侧的写出流，整块响应才能做 §7.5 的整块校验。
+- `reasoning_effort` 来自配置，默认 `low`；配置为空时省略该字段。取值原样发送，由端点解释。
 - `max_tokens` 只在配置了非空值时才带；字段名必须是 `max_tokens`。
 - 不发 `n`、`top_p`、`seed`、`user`。
 - 响应取 `choices[0].message.content` 与 `choices[0].finish_reason`。

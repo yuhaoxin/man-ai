@@ -112,11 +112,12 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let cache = ctx.cache;
     let lang_tag = ctx.lang.tag();
     let parts = backend.map(|backend| {
-        let (endpoint, model) = backend.key_parts();
+        let (endpoint, model, reasoning_effort) = backend.key_parts();
         KeyParts {
             lang: lang_tag,
             endpoint,
             model,
+            reasoning_effort,
         }
     });
     let system = system.as_str();

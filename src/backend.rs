@@ -11,12 +11,12 @@ use async_openai::middleware::ReqwestService;
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestUserMessage, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, FinishReason,
+    CreateChatCompletionResponse, FinishReason, ReasoningEffort,
 };
 
 use async_openai::{Chat, Client};
 
-use crate::config::Config;
+use crate::config::{Config, ReasoningEffort as ConfigEffort};
 
 /// 五个固定原因（§10.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,6 +79,7 @@ pub struct Backend {
     /// 配置原值；缓存键里用它的规范化形式（§9.1）。
     endpoint: String,
     model: String,
+    reasoning_effort: Option<ConfigEffort>,
     max_tokens: Option<u32>,
 }
 
@@ -123,13 +124,15 @@ impl Backend {
             client,
             endpoint: endpoint.to_string(),
             model: model.to_string(),
+            reasoning_effort: config.reasoning_effort,
             max_tokens: config.max_tokens,
         })
     }
 
-    /// 缓存键需要的后端身份：端点配置原值与模型名。
-    pub fn key_parts(&self) -> (&str, &str) {
-        (&self.endpoint, &self.model)
+    /// 缓存键需要的后端身份：端点配置原值、模型名与思考强度。
+    pub fn key_parts(&self) -> (&str, &str, &'static str) {
+        let effort = self.reasoning_effort.map_or("off", ConfigEffort::as_str);
+        (&self.endpoint, &self.model, effort)
     }
 
     /// 单次尝试（§7.1、§10.3）。
@@ -145,6 +148,9 @@ impl Backend {
             .messages(messages)
             .temperature(0.0_f32)
             .stream(false);
+        if let Some(effort) = self.reasoning_effort {
+            builder.reasoning_effort(openai_effort(effort));
+        }
         if let Some(max_tokens) = self.max_tokens {
             builder.max_tokens(max_tokens);
         }
@@ -187,6 +193,18 @@ fn not_configured(item: &str) -> Failure {
     Failure::new(Reason::NotConfigured, false).with_diagnostic(format!(
         "backend not configured (missing {item}); not translating"
     ))
+}
+
+fn openai_effort(effort: ConfigEffort) -> ReasoningEffort {
+    match effort {
+        ConfigEffort::None => ReasoningEffort::None,
+        ConfigEffort::Minimal => ReasoningEffort::Minimal,
+        ConfigEffort::Low => ReasoningEffort::Low,
+        ConfigEffort::Medium => ReasoningEffort::Medium,
+        ConfigEffort::High => ReasoningEffort::High,
+        ConfigEffort::Xhigh => ReasoningEffort::Xhigh,
+        ConfigEffort::Max => ReasoningEffort::Max,
+    }
 }
 
 fn resolve_key(config: &Config) -> Option<String> {

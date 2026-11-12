@@ -13,6 +13,46 @@ use toml::Value;
 
 use crate::language::Language;
 
+/// §10.2 思考强度；取值与 OpenAI `reasoning_effort` 一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    #[default]
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 /// §10.2 全键。必填项缺失保持 `None`（= not configured），其余为默认值。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -22,6 +62,8 @@ pub struct Config {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
+    /// `None` 表示不发送该字段（配置为空）。
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: Option<u32>,
     pub timeout_seconds: f64,
     pub concurrency: usize,
@@ -38,6 +80,7 @@ impl Default for Config {
             model: None,
             api_key: None,
             api_key_env: None,
+            reasoning_effort: Some(ReasoningEffort::default()),
             max_tokens: None,
             timeout_seconds: 30.0,
             concurrency: 4,
@@ -128,6 +171,14 @@ pub fn load(path: Option<&Path>) -> LoadedConfig {
                 loaded.config.api_key_env =
                     optional_string(&value, &mut loaded.warnings, "api_key_env")
             }
+            "reasoning_effort" => match value.as_str().map(str::trim) {
+                Some("") => loaded.config.reasoning_effort = None,
+                Some(raw) => match ReasoningEffort::parse(raw) {
+                    Some(effort) => loaded.config.reasoning_effort = Some(effort),
+                    None => invalid(&mut loaded.warnings, "reasoning_effort"),
+                },
+                None => invalid(&mut loaded.warnings, "reasoning_effort"),
+            },
             "max_tokens" => match value.as_integer().and_then(|v| u32::try_from(v).ok()) {
                 Some(tokens) if tokens > 0 => loaded.config.max_tokens = Some(tokens),
                 _ => invalid(&mut loaded.warnings, "max_tokens"),
@@ -230,6 +281,7 @@ endpoint = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 api_key = "sk-test"
 api_key_env = "DEEPSEEK_API_KEY"
+reasoning_effort = "high"
 max_tokens = 4096
 timeout_seconds = 12.5
 concurrency = 8
@@ -256,6 +308,7 @@ proxy = "socks5://127.0.0.1:1080"
         assert_eq!(config.lang, None);
         assert_eq!(config.endpoint, None);
         assert_eq!(config.model, None);
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Low));
         assert_eq!(config.max_tokens, None);
         assert_eq!(config.timeout_seconds, 30.0);
         assert_eq!(config.concurrency, 4);
@@ -319,6 +372,31 @@ proxy = "socks5://127.0.0.1:1080"
             ]
         );
         assert_eq!(loaded.config, Config::default());
+    }
+
+    #[test]
+    fn reasoning_effort_校验取值并支持空值() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_toml(&dir, "reasoning_effort = \"turbo\"\n");
+        assert_eq!(
+            loaded.warnings,
+            vec!["man-ai: ignoring invalid config key reasoning_effort".to_string()]
+        );
+        assert_eq!(loaded.config.reasoning_effort, Some(ReasoningEffort::Low));
+
+        let loaded = load_toml(&dir, "reasoning_effort = 1\n");
+        assert_eq!(
+            loaded.warnings,
+            vec!["man-ai: ignoring invalid config key reasoning_effort".to_string()]
+        );
+
+        let loaded = load_toml(&dir, "reasoning_effort = \"\"\n");
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.reasoning_effort, None);
+
+        let loaded = load_toml(&dir, "reasoning_effort = \"HIGH\"\n");
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -402,6 +480,7 @@ proxy = "socks5://127.0.0.1:1080"
         assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
         assert_eq!(config.api_key.as_deref(), Some("sk-test"));
         assert_eq!(config.api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(config.max_tokens, Some(4096));
         assert_eq!(config.timeout_seconds, 12.5);
         assert_eq!(config.concurrency, 8);

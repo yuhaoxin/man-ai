@@ -63,11 +63,12 @@ pub fn run(rest: &[OsString], lang: &Language, config: &Config, tty: bool) -> i3
             return fallback(tty, lang, &failure, &captured.stdout, man_code);
         }
     };
-    let (endpoint, model) = backend.key_parts();
+    let (endpoint, model, reasoning_effort) = backend.key_parts();
     let parts = KeyParts {
         lang: lang.tag(),
         endpoint,
         model,
+        reasoning_effort,
     };
 
     // 命中直接采用，不重新校验（§9.3）。

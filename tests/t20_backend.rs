@@ -44,8 +44,18 @@ fn 请求体字段固定且系统提示逐字节() {
     let body = request.body.as_object().unwrap();
     let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
     keys.sort();
-    assert_eq!(keys, ["messages", "model", "stream", "temperature"]);
+    assert_eq!(
+        keys,
+        [
+            "messages",
+            "model",
+            "reasoning_effort",
+            "stream",
+            "temperature"
+        ]
+    );
     assert_eq!(request.body["model"], "test-model");
+    assert_eq!(request.body["reasoning_effort"], "low");
     assert_eq!(request.body["temperature"].as_f64(), Some(0.0));
     assert_eq!(request.body["stream"], json!(false));
 
@@ -55,6 +65,30 @@ fn 请求体字段固定且系统提示逐字节() {
     assert_eq!(messages[0]["content"], prompt::page(&lang()));
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], input);
+}
+
+#[test]
+fn reasoning_effort_默认_low_可覆盖_空值不发送() {
+    for (tag, config, expected) in [
+        ("effort-default", "", Some("low")),
+        ("effort-high", "reasoning_effort = \"high\"\n", Some("high")),
+        ("effort-off", "reasoning_effort = \"\"\n", None),
+    ] {
+        let model = FakeModel::start(vec![Reply::Ok(completion("ok\n", "stop"))]);
+        let dir = TempDir::new(tag);
+        dir.write_config(&model_config(&model, config));
+        let run = translate(&dir, b"block\n");
+        assert_eq!(run.code, 0);
+        let request = &model.requests()[0];
+        match expected {
+            Some(value) => assert_eq!(request.body["reasoning_effort"], value, "{tag}"),
+            None => assert!(
+                request.body.get("reasoning_effort").is_none(),
+                "{tag}: {}",
+                request.body
+            ),
+        }
+    }
 }
 
 #[test]

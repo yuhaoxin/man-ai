@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::prompt::PROMPT_VERSION;
 
 /// 回写协议、校验语义或键结构变化时递增（§9.1）。
-pub const CACHE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 2;
 
 /// `v1/tmp` 中滞留超过这个时长的文件在剪枝时删除（§9.5）。
 const STALE_TMP: Duration = Duration::from_secs(3600);
@@ -42,6 +42,8 @@ pub struct KeyParts<'a> {
     pub lang: &'a str,
     pub endpoint: &'a str,
     pub model: &'a str,
+    /// 实际发送的思考强度；`off` 表示配置为空、不发送。
+    pub reasoning_effort: &'a str,
 }
 
 /// 关闭或不可用时 `state` 为 `None`，所有操作 no-op。
@@ -252,24 +254,24 @@ fn remove_stale_tmp(tmp: &Path) {
 pub fn key(form: Form, parts: &KeyParts<'_>, input: &[u8]) -> Option<String> {
     let endpoint = normalize_endpoint(parts.endpoint)?;
     Some(key_versioned(
-        CACHE_VERSION,
-        PROMPT_VERSION,
+        (CACHE_VERSION, PROMPT_VERSION),
         form,
         parts.lang,
         &endpoint,
         parts.model,
+        parts.reasoning_effort,
         input,
     ))
 }
 
 /// 版本号可注入，便于测试旧键不命中。
 fn key_versioned(
-    cache_version: u32,
-    prompt_version: u32,
+    (cache_version, prompt_version): (u32, u32),
     form: Form,
     lang: &str,
     endpoint: &str,
     model: &str,
+    reasoning_effort: &str,
     input: &[u8],
 ) -> String {
     let cache_version = cache_version.to_string();
@@ -282,6 +284,7 @@ fn key_versioned(
         lang.as_bytes(),
         endpoint.as_bytes(),
         model.as_bytes(),
+        reasoning_effort.as_bytes(),
     ] {
         feed(&mut hasher, field);
     }
@@ -326,6 +329,7 @@ mod tests {
             lang,
             endpoint,
             model,
+            reasoning_effort: "low",
         }
     }
 
@@ -404,6 +408,14 @@ mod tests {
             ),
             key(
                 Form::Page,
+                &KeyParts {
+                    reasoning_effort: "high",
+                    ..parts("zh-CN", "https://api.example.com/v1", "m")
+                },
+                b"input\n",
+            ),
+            key(
+                Form::Page,
                 &parts("zh-CN", "https://api.example.com/v1", "m"),
                 b"input!\n",
             ),
@@ -447,11 +459,45 @@ mod tests {
 
     #[test]
     fn 版本变化后键不同() {
-        let left = key_versioned(1, 2, Form::Page, "zh-CN", "https://e.com", "m", b"x");
-        let cache_bump = key_versioned(2, 2, Form::Page, "zh-CN", "https://e.com", "m", b"x");
-        let prompt_bump = key_versioned(1, 3, Form::Page, "zh-CN", "https://e.com", "m", b"x");
+        let left = key_versioned(
+            (1, 2),
+            Form::Page,
+            "zh-CN",
+            "https://e.com",
+            "m",
+            "low",
+            b"x",
+        );
+        let cache_bump = key_versioned(
+            (2, 2),
+            Form::Page,
+            "zh-CN",
+            "https://e.com",
+            "m",
+            "low",
+            b"x",
+        );
+        let prompt_bump = key_versioned(
+            (1, 3),
+            Form::Page,
+            "zh-CN",
+            "https://e.com",
+            "m",
+            "low",
+            b"x",
+        );
+        let effort_bump = key_versioned(
+            (1, 2),
+            Form::Page,
+            "zh-CN",
+            "https://e.com",
+            "m",
+            "high",
+            b"x",
+        );
         assert_ne!(left, cache_bump);
         assert_ne!(left, prompt_bump);
+        assert_ne!(left, effort_bump);
         assert_ne!(cache_bump, prompt_bump);
     }
 

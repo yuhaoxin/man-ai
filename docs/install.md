@@ -124,6 +124,10 @@ api_key = ""
 # Name of an environment variable that holds the key; read at request time.
 api_key_env = "DEEPSEEK_API_KEY"
 
+# Reasoning effort: none|minimal|low|medium|high|xhigh|max.
+# Empty omits the field; default is "low".
+reasoning_effort = "low"
+
 # Optional per-request limit; omitted means the field is not sent.
 max_tokens = 4096
 
