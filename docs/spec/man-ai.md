@@ -209,7 +209,7 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 - 每个候选按 shell 词法拆词：空白分词，单双引号与反斜杠转义生效；不支持管道、命令替换与变量展开。`|` 按普通字符处理。
 - 拆词失败（如引号不闭合）向 stderr 警告一行，跳到下一候选。
 - 每个候选的首个词按 PATH 或路径解析；realpath 等于 man-ai 自身则跳过，避免递归。
-- man 传给 man-ai 的剩余 argv（已剥离自有参数）原样追加到分页器命令行末尾。
+- man 传给 man-ai 的剩余 argv（已剥离自有参数）原样追加到分页器命令行末尾；`-k`/`-f` 路径不追加，因为那里的 argv 是检索词而不是分页器参数。
 - 整条链都不可用（未设、解析失败、递归跳过、可执行文件不存在）时，把文本直写 stdout，退出 0。
 - 不注入 `-R` 等额外 flag；默认值 `less -sR` 覆盖 SGR 场景，用户自定义分页器自负其责。
 - `LESS` 不由 man-ai 设置，也不参与解析。
@@ -963,6 +963,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 | HTTP 传输 | `reqwest 0.13`（`rustls` + `socks`） | 构造带单次超时与显式代理的 Client；系统信任库 |
 | 并发 | `tokio 1`（`rt-multi-thread`）+ `futures 0.3` | `buffered(concurrency)` 同时给出在途上限与按块序产出 |
 | 配置 | `toml` + `serde` + `serde_ignored` | 未知键告警；逐键校验由契约代码负责 |
+| JSON | `serde_json` | `-k`/`-f` 描述数组的请求体、响应校验与缓存条目 |
 | BLAKE3-128 | `blake3` | 标准库无 BLAKE3；取摘要前 16 字节 |
 | 原子写 | `tempfile` | `NamedTempFile::persist` 即 tmp+rename；`PermissionsExt` 设 0600 |
 | 信号 | `signal-hook` | 两阶段 SIGINT；忽略 SIGPIPE 后按写失败处理 |
