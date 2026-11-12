@@ -127,7 +127,7 @@ impl Cache {
         if total <= limit {
             return;
         }
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries.sort_by_key(|entry| entry.0);
         let target = limit / 100 * 80;
         for (_, size, path) in entries {
             if total <= target {
@@ -519,8 +519,10 @@ mod tests {
     #[test]
     fn 关闭时不建目录也不读不写() {
         let dir = temp("disabled");
-        let mut config = Config::default();
-        config.cache_enabled = false;
+        let config = Config {
+            cache_enabled: false,
+            ..Config::default()
+        };
         let (cache, warning) = open(&config);
         assert_eq!(warning, None);
         assert!(!cache.enabled());
