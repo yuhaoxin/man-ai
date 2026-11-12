@@ -227,7 +227,7 @@ fn 分页器模式把配置告警写到_stderr_并原文直通() {
 fn 配置文件语法错误时整体按默认并告警() {
     let dir = TempDir::new("config-syntax");
     let path = write_config(&dir, "lang = \"ja\nendpoint = \"x\"\n");
-    let out = run(&[], &dir, &[], b"page\n");
+    let out = run(&["--lang", "zh-CN"], &dir, &[], b"page\n");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"page\n");
     assert_eq!(
@@ -243,7 +243,7 @@ fn 配置文件语法错误时整体按默认并告警() {
 fn 配置语言非法时告警但不退出二() {
     let dir = TempDir::new("config-lang");
     write_config(&dir, "lang = \"zh CN\"\n");
-    let out = run(&[], &dir, &[], b"page\n");
+    let out = run(&["--lang", "zh-CN"], &dir, &[], b"page\n");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"page\n");
     assert_eq!(
@@ -311,4 +311,26 @@ fn 配置语言为空时不报错() {
     let out = run(&[], &dir, &[], b"page\n");
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty(), "{}", stderr_text(&out));
+}
+
+#[test]
+fn 英语路径不输出配置告警_非英语路径输出() {
+    let dir = TempDir::new("warnings-lang");
+    write_config(&dir, "colour = \"blue\"\n");
+    let page: &[u8] = b"page\n";
+
+    for env in [vec![("LANG", "en_US.UTF-8")], vec![("LANG", "C")]] {
+        let out = run(&[], &dir, &env, page);
+        assert_eq!(out.status.code(), Some(0), "{env:?}");
+        assert_eq!(out.stdout, page, "{env:?}");
+        assert!(out.stderr.is_empty(), "{env:?}: {}", stderr_text(&out));
+    }
+
+    let out = run(&[], &dir, &[("LANG", "zh_CN.UTF-8")], page);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, page);
+    assert_eq!(
+        stderr_text(&out),
+        "man-ai: ignoring unknown config key colour\n"
+    );
 }

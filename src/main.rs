@@ -78,15 +78,18 @@ fn resolve_lang(own: &cli::OwnArgs) -> Result<Option<Language>, i32> {
 /// 本票没有翻译路径，原文按内层分页器链或 stdout 输出。
 fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
     let loaded = config::load(config::config_path().as_deref());
-    for warning in &loaded.warnings {
-        eprintln!("{warning}");
-    }
     let config_lang = loaded
         .config
         .lang
         .as_deref()
         .and_then(Language::from_config);
     let lang = Language::resolve(cli_lang, config_lang);
+    // §11.3：主标签为 en 时整条路径不写 stderr，配置告警也不例外。
+    if !lang.is_english() {
+        for warning in &loaded.warnings {
+            eprintln!("{warning}");
+        }
+    }
 
     let mut input = Vec::new();
     let _ = io::stdin().read_to_end(&mut input);

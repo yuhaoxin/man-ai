@@ -100,7 +100,7 @@ pub fn load(path: Option<&Path>) -> LoadedConfig {
         match key.as_str() {
             "lang" => {
                 let Some(raw) = value.as_str() else {
-                    invalid(&mut loaded, "lang");
+                    invalid(&mut loaded.warnings, "lang");
                     continue;
                 };
                 match Language::from_config(raw) {
@@ -111,46 +111,58 @@ pub fn load(path: Option<&Path>) -> LoadedConfig {
                         .push(format!("man-ai: ignoring invalid config key lang: {raw}")),
                 }
             }
-            "endpoint" => match string_value(&value) {
-                Some(raw) if valid_endpoint(raw) => {
-                    loaded.config.endpoint = Some(raw.to_string());
+            "endpoint" => {
+                let raw = optional_string(&value, &mut loaded.warnings, "endpoint");
+                match raw {
+                    Some(raw) if valid_endpoint(&raw) => loaded.config.endpoint = Some(raw),
+                    Some(_) => invalid(&mut loaded.warnings, "endpoint"),
+                    None => {}
                 }
-                Some(_) => invalid(&mut loaded, "endpoint"),
-                None => {}
-            },
-            "model" => loaded.config.model = string_value(&value).map(str::to_string),
-            "api_key" => loaded.config.api_key = string_value(&value).map(str::to_string),
-            "api_key_env" => loaded.config.api_key_env = string_value(&value).map(str::to_string),
+            }
+            "model" => loaded.config.model = optional_string(&value, &mut loaded.warnings, "model"),
+            "api_key" => {
+                loaded.config.api_key = optional_string(&value, &mut loaded.warnings, "api_key")
+            }
+            "api_key_env" => {
+                loaded.config.api_key_env =
+                    optional_string(&value, &mut loaded.warnings, "api_key_env")
+            }
             "max_tokens" => match value.as_integer().and_then(|v| u32::try_from(v).ok()) {
                 Some(tokens) if tokens > 0 => loaded.config.max_tokens = Some(tokens),
-                _ => invalid(&mut loaded, "max_tokens"),
+                _ => invalid(&mut loaded.warnings, "max_tokens"),
             },
             "timeout_seconds" => {
                 let seconds = value
                     .as_float()
                     .or_else(|| value.as_integer().map(|v| v as f64));
                 match seconds {
-                    Some(seconds) if seconds > 0.0 => loaded.config.timeout_seconds = seconds,
-                    _ => invalid(&mut loaded, "timeout_seconds"),
+                    Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
+                        loaded.config.timeout_seconds = seconds;
+                    }
+                    // inf/nan 会让 Duration::from_secs_f64 直接 panic。
+                    _ => invalid(&mut loaded.warnings, "timeout_seconds"),
                 }
             }
             "concurrency" => match value.as_integer() {
                 Some(v) if v >= 1 => loaded.config.concurrency = v as usize,
-                _ => invalid(&mut loaded, "concurrency"),
+                _ => invalid(&mut loaded.warnings, "concurrency"),
             },
             "cache_enabled" => match value.as_bool() {
                 Some(enabled) => loaded.config.cache_enabled = enabled,
-                None => invalid(&mut loaded, "cache_enabled"),
+                None => invalid(&mut loaded.warnings, "cache_enabled"),
             },
             "cache_max_mb" => match value.as_integer() {
                 Some(v) if v >= 0 => loaded.config.cache_max_mb = v as u64,
-                _ => invalid(&mut loaded, "cache_max_mb"),
+                _ => invalid(&mut loaded.warnings, "cache_max_mb"),
             },
-            "proxy" => match string_value(&value) {
-                Some(raw) if valid_proxy(raw) => loaded.config.proxy = Some(raw.to_string()),
-                Some(_) => invalid(&mut loaded, "proxy"),
-                None => {}
-            },
+            "proxy" => {
+                let raw = optional_string(&value, &mut loaded.warnings, "proxy");
+                match raw {
+                    Some(raw) if valid_proxy(&raw) => loaded.config.proxy = Some(raw),
+                    Some(_) => invalid(&mut loaded.warnings, "proxy"),
+                    None => {}
+                }
+            }
             _ => loaded
                 .warnings
                 .push(format!("man-ai: ignoring unknown config key {key}")),
@@ -166,18 +178,20 @@ fn parse_warning(path: &Path) -> String {
     )
 }
 
-fn invalid(loaded: &mut LoadedConfig, key: &str) {
-    loaded
-        .warnings
-        .push(format!("man-ai: ignoring invalid config key {key}"));
+fn invalid(warnings: &mut Vec<String>, key: &str) {
+    warnings.push(format!("man-ai: ignoring invalid config key {key}"));
 }
 
-/// 空串与纯空白视为未设置。
-fn string_value(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
+/// 字符串键：类型不符告警并返回 `None`；空串与纯空白视为未设置，不告警。
+fn optional_string(value: &Value, warnings: &mut Vec<String>, key: &str) -> Option<String> {
+    match value.as_str().map(str::trim) {
+        Some(text) if !text.is_empty() => Some(text.to_string()),
+        Some(_) => None,
+        None => {
+            invalid(warnings, key);
+            None
+        }
+    }
 }
 
 /// §10.2：只接受 http/https、必须有 host、不含查询串与片段。
@@ -447,5 +461,54 @@ proxy = "socks5://127.0.0.1:1080"
             Some(PathBuf::from("/xdg/man-ai/config.toml"))
         );
         assert_eq!(config_path_from(None, None), None);
+    }
+
+    #[test]
+    fn 非字符串类型的字符串键逐个告警() {
+        let dir = TempDir::new("types");
+        let loaded = load_toml(
+            &dir,
+            "lang = 3\nendpoint = 5\nmodel = 1\napi_key = true\napi_key_env = []\nproxy = 0.5\n",
+        );
+        let mut warnings = loaded.warnings.clone();
+        warnings.sort();
+        assert_eq!(
+            warnings,
+            vec![
+                "man-ai: ignoring invalid config key api_key",
+                "man-ai: ignoring invalid config key api_key_env",
+                "man-ai: ignoring invalid config key endpoint",
+                "man-ai: ignoring invalid config key lang",
+                "man-ai: ignoring invalid config key model",
+                "man-ai: ignoring invalid config key proxy",
+            ]
+        );
+        assert_eq!(loaded.config, Config::default());
+    }
+
+    #[test]
+    fn 空串的字符串键按未设置处理且不告警() {
+        let dir = TempDir::new("empty-strings");
+        let loaded = load_toml(
+            &dir,
+            "lang = \"\"\nendpoint = \"\"\nmodel = \"\"\n\
+             api_key = \"\"\napi_key_env = \"\"\nproxy = \"\"\n",
+        );
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.config, Config::default());
+    }
+
+    #[test]
+    fn 非有限的超时时间告警并按默认值() {
+        let dir = TempDir::new("timeout-nonfinite");
+        for raw in ["inf", "nan", "-inf"] {
+            let loaded = load_toml(&dir, &format!("timeout_seconds = {raw}\n"));
+            assert_eq!(
+                loaded.warnings,
+                vec!["man-ai: ignoring invalid config key timeout_seconds".to_string()],
+                "{raw}"
+            );
+            assert_eq!(loaded.config.timeout_seconds, 30.0, "{raw}");
+        }
     }
 }
