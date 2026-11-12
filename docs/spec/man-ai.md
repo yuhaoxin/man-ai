@@ -139,6 +139,7 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 | `MAN_AI_PAGER` | 薄壳写；分页器模式读 | 保存用户原有的 `MANPAGER`，供内层分页器链使用 |
 | `PAGER` | 分页器模式读 | 内层分页器链第二候选 |
 | `LESS` | 不读不写 | less 自己读取；man-ai 不设置 |
+| `LESSCHARSET` | 读；未设置且内层分页器为 less 时写 `UTF-8` | 译文是 UTF-8；避免 ASCII locale 下 less 把字节显示成 `<E7>` |
 | `WHATISPAGER` | `-k` 拦截时写 `cat` | 让 BSD man 的 `-k` 输出直达管道 |
 | `LC_ALL` / `LC_MESSAGES` / `LANG` | 读 | 语言来源链，优先级见 §11.1 |
 | `LANGUAGE` | 不读 | 只影响 gettext 消息，不决定页面语言 |
@@ -213,6 +214,7 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 - 整条链都不可用（未设、解析失败、递归跳过、可执行文件不存在）时，把文本直写 stdout，退出 0。
 - 不注入 `-R` 等额外 flag；默认值 `less -sR` 覆盖 SGR 场景，用户自定义分页器自负其责。
 - `LESS` 不由 man-ai 设置，也不参与解析。
+- 内层分页器为 `less` 且环境未设置 `LESSCHARSET` 时，man-ai 为其子进程设 `LESSCHARSET=UTF-8`：译文始终是 UTF-8，而 less 在 `LANG=C` 等 ASCII locale 下会把每个字节显示成 `<E7>`。用户显式设置的 `LESSCHARSET` 优先，其他分页器不受影响。
 - 分页器启动后 man-ai 不写 stderr。
 
 ### 5.6 信号、超时与失败

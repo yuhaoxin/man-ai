@@ -157,11 +157,21 @@ pub fn start(chain: &Chain, extra: &[OsString]) -> io::Result<(Child, ChildStdin
 }
 
 fn spawn(chain: &Chain, extra: &[OsString]) -> io::Result<Child> {
-    Command::new(&chain.program)
-        .args(&chain.args)
-        .args(extra)
+    let charset_set = env::var_os("LESSCHARSET").is_some();
+    pager_command(chain, extra, charset_set)
         .stdin(Stdio::piped())
         .spawn()
+}
+
+/// 译文始终是 UTF-8；less 在 ASCII locale 下会把每个字节显示成 `<E7>`。
+/// 仅在 less 且用户没有显式设置字符集时注入，显式设置优先。
+fn pager_command(chain: &Chain, extra: &[OsString], charset_set: bool) -> Command {
+    let mut command = Command::new(&chain.program);
+    command.args(&chain.args).args(extra);
+    if !charset_set && chain.program.file_name().is_some_and(|name| name == "less") {
+        command.env("LESSCHARSET", "UTF-8");
+    }
+    command
 }
 
 /// 子进程被信号杀死时为 `128 + 信号编号`（§4.4）。
@@ -174,6 +184,31 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn less_未显式设置字符集时注入_utf8() {
+        let less = Chain {
+            program: PathBuf::from("less"),
+            args: vec!["-sR".to_string()],
+        };
+        let injected = pager_command(&less, &[], false);
+        assert!(injected.get_envs().any(|(key, value)| {
+            key == "LESSCHARSET" && value == Some(std::ffi::OsStr::new("UTF-8"))
+        }));
+
+        let explicit = pager_command(&less, &[], true);
+        assert!(!explicit.get_envs().any(|(key, _)| key == "LESSCHARSET"));
+
+        let other = Chain {
+            program: PathBuf::from("cat"),
+            args: Vec::new(),
+        };
+        assert!(
+            !pager_command(&other, &[], false)
+                .get_envs()
+                .any(|(key, _)| key == "LESSCHARSET")
+        );
+    }
 
     #[test]
     fn 空白分词() {
