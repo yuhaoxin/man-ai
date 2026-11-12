@@ -105,6 +105,7 @@
 MANPAGER="man-ai [--lang <规范标签>] [--no-translate|--translate]"
 ```
 
+- 只附加用户在 argv 中显式给出的 `--lang` 与 `--translate`/`--no-translate`；未给出的不由薄壳补默认值。
 - 标签已通过形状校验，只含 `[A-Za-z0-9-]`，不需要 shell 引号。
 - 分页器模式按同一套规则剥离自有参数；剩余 argv 原样追加到内层分页器命令行末尾（例：`MANPAGER="man-ai -X"` 时 less 收到 `-X`）。
 - 薄壳模式依赖 `man-ai` 在 PATH 中；`MANPAGER` 值写二进制名，不写绝对路径。
@@ -195,7 +196,7 @@ argv 中出现 `-P`（含紧凑写法）或 `--pager` 时：
 2. 运行 `man` 与剩余参数，捕获 stdout。退出码记为 man 的退出码。
 3. 捕获为空：不翻译、不起分页器、不写页首行，透传退出码。
 4. 逐行处理，保留行尾。每行在**第一个** `" - "` 处切成名字列与描述；名字列（含 `name(section)`、逗号、padding、省略号）逐字节保留，只替换描述。没有 `" - "` 的行原样保留、不送翻译。
-5. 收集所有可翻译描述为 JSON 字符串数组，一次请求（§7.6）。非 UTF-8 行不送模型，原样保留。数组为空时不发请求，结果原样输出。
+5. 收集所有可翻译描述为 JSON 字符串数组，一次请求（§7.6）。非 UTF-8 行不送模型，原样保留。数组为空时不发请求、不写页首行，结果原样交给内层分页器或直写 stdout。
 6. 采用：名字列 + 译文描述 + 原行尾。整批失败：所有描述保留原文。至少一个描述采用时页首行用「已翻译」，整批失败用「翻译失败」。
 7. stdout 是 TTY：页首行 + 空行 + 结果行交内层分页器链，退出码取分页器；链不可用时直写 stdout，退出码取 man 的。
 8. stdout 非 TTY：直写 stdout，不写页首行。成功静默；整批失败时 stderr 一行 `man-ai: 翻译失败（<原因>），以下为原文` 再写原文。
@@ -925,6 +926,7 @@ v1 不签名、不公证：
 内嵌 dev-dependency 起的本地 HTTP server，由响应脚本驱动，不用外部进程，不引 wiremock。脚本覆盖：
 
 - 200 正常。
+- 原样回显：按采用处理，不计失败。
 - 400/401 确定性不重试。
 - 429 与 500 重试一次后成功与失败。
 - 超时（服务端 sleep 超过 `timeout_seconds`）。
@@ -946,7 +948,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 ### 13.6 文档检查
 
 - 规格不含未决占位词。
-- §16 的每个规格章节都有对应的闭合决策票。
+- §16 的每个决策章节都有对应的闭合决策票；术语、已知限制与追溯表本身不单列来源。
 - 术语与 `GLOSSARY.md` 一致。
 
 ## 14. 依赖
@@ -955,7 +957,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 |---|---|---|
 | CLI 解析 | 手写（约 40 行） | 未知参数与 `--` 之后必须按原序原样交回 man；clap 会在未知参数上报错或吞进匹配分支，保不住原序 |
 | 内层分页器拆词 | 手写（约 30 行） | 契约只是空白、引号、反斜杠；不引入 shell 解析库 |
-| HTTP 客户端 | `async-openai 0.43`（`chat-completion` + `rustls`） | 复用 OpenAI 兼容请求/响应类型；同步无重试，错误带原始 status 与 `error.code` |
+| HTTP 客户端 | `async-openai 0.43`（`chat-completion` + `rustls`） | 复用 OpenAI 兼容请求/响应类型；异步且无内置重试，错误带原始 status 与 `error.code` |
 | HTTP 传输 | `reqwest 0.13`（`rustls` + `socks`） | 构造带单次超时与显式代理的 Client；系统信任库 |
 | 并发 | `tokio 1`（`rt-multi-thread`）+ `futures 0.3` | `buffered(concurrency)` 同时给出在途上限与按块序产出 |
 | 配置 | `toml` + `serde` + `serde_ignored` | 未知键告警；逐键校验由契约代码负责 |
@@ -1004,8 +1006,8 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 | §1 定位、§3 模式、§5.1–5.2 接入、§5.5–5.6 分页器与信号 | [接入契约：MANPAGER 生命周期与 man-ai 薄壳](https://github.com/yuhaoxin/man-ai/issues/2) |
 | §3.2 入口矩阵、§5.3 非 TTY、§5.4 `-k` | [非分页路径：-k、-w、-t、非 TTY 与重定向](https://github.com/yuhaoxin/man-ai/issues/3) |
 | §6 分段与回写 | [渲染文本的分段与重组协议](https://github.com/yuhaoxin/man-ai/issues/4) |
-| §7 提示词与校验、§7.7 状态机 | [提示词契约：不译规则、术语一致与失败检测](https://github.com/yuhaoxin/man-ai/issues/5) |
-| §8 流式与首屏、§8.3 尾行 | [流式翻译与首屏延迟](https://github.com/yuhaoxin/man-ai/issues/6) |
+| §7 提示词与校验、§7.7 状态机 | [提示词契约：不译规则、术语一致与失败检测](https://github.com/yuhaoxin/man-ai/issues/5)；[语言解析与配置文件](https://github.com/yuhaoxin/man-ai/issues/9)（规则 8、原样回显判定） |
+| §8 流式与首屏、§8.3 尾行 | [流式翻译与首屏延迟](https://github.com/yuhaoxin/man-ai/issues/6)；[AI 后端端点与配置契约](https://github.com/yuhaoxin/man-ai/issues/8)（模型不可达停止提交） |
 | §9 缓存 | [缓存键、失效与存储](https://github.com/yuhaoxin/man-ai/issues/7) |
 | §10 后端与配置 | [AI 后端端点与配置契约](https://github.com/yuhaoxin/man-ai/issues/8) |
 | §11 语言 | [语言解析与配置文件](https://github.com/yuhaoxin/man-ai/issues/9) |
