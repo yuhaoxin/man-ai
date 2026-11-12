@@ -1,13 +1,13 @@
-# CI matrix for man-ai (§13.5). All names and descriptions are English.
+# man-ai 的 CI 矩阵（§13.5）。workflow 与 job 的 name 保留英文。
 #
-# Row 1: ubuntu-24.04 (man-db + groff)  -- everything, license audit.
-# Row 2: macos-15 (arm64, BSD man + mandoc) -- everything.
-# Row 3: macos-15-intel (x86_64) -- everything.
-# Row 4: Alpine container (musl) -- build, unit tests, non-TTY path and
-#        -w/-k/-t passthrough; no differential tests (its man is mandoc).
+# 第 1 行：ubuntu-24.04（man-db + groff）—— 全部测试与许可审计。
+# 第 2 行：macos-15（arm64，BSD man + mandoc）—— 全部测试。
+# 第 3 行：macos-15-intel（x86_64）—— 全部测试。
+# 第 4 行：Alpine 容器（musl）—— 构建、单元测试、非 TTY 路径与
+#          -w/-k/-t 透传；不做差分测试（其 man 来自 mandoc）。
 #
-# macOS Intel runners are retired in 2027-08; delete row 3 then and replace the
-# darwin-x64 artifact coverage separately.
+# macOS Intel runner 将于 2027-08 退役；届时删除第 3 行，darwin-x64
+# 产物的覆盖另行讨论。
 
 name: CI
 
@@ -28,13 +28,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install man and groff
+      - name: 安装 man 与 groff
         run: sudo apt-get update && sudo apt-get install -y man-db groff
-      - name: Test
+      - name: 测试
         run: cargo test
-      - name: Release build
+      - name: Release 构建
         run: cargo build --release
-      - name: License and advisory audit
+      - name: 许可与安全公告审计
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses advisories
@@ -46,22 +46,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test
+      - name: 测试
         run: cargo test
-      - name: Release build
+      - name: Release 构建
         run: cargo build --release
 
   macos-intel:
-    # 2027-08: macos-15-intel runners are retired; delete this job then.
+    # 2027-08：macos-15-intel runner 退役，届时删除本 job。
     name: macOS x86_64 (macos-15-intel, retired 2027-08)
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test
+      - name: 测试
         run: cargo test
-      - name: Release build
+      - name: Release 构建
         run: cargo build --release
 
   alpine:
@@ -69,24 +69,48 @@ jobs:
     runs-on: ubuntu-24.04
     container: rust:alpine
     steps:
-      - name: Install build and man tooling
-        run: apk add --no-cache git build-base cmake perl mandoc man-pages less util-linux-misc
+      # rust:alpine 没有 node，而 actions/checkout 需要 node。
+      - name: 安装构建与 man 工具
+        run: apk add --no-cache git build-base cmake perl nodejs mandoc man-pages less util-linux-misc
       - uses: actions/checkout@v4
-      - name: Release build
+      - name: Release 构建
         run: cargo build --release
-      - name: Unit tests
+      - name: 单元测试
         run: cargo test --lib
-      - name: Non-TTY integration tests (no pty, no real-man differential)
+      - name: 非 TTY 集成测试（不用 pty，不做真 man 差分）
         run: cargo test --test t20_backend --test t21_concurrency
-      - name: Non-TTY default path passes bytes through
+      - name: 非 TTY 默认路径逐字节透传
         run: |
           printf 'LS(1)\n\n     ls - list directory contents\n' > /tmp/page.txt
           ./target/release/man-ai --no-translate < /tmp/page.txt | cmp - /tmp/page.txt
           ./target/release/man-ai --lang en < /tmp/page.txt | cmp - /tmp/page.txt
-      - name: Passthrough entries in a pty (-w / -k / -t)
-        # -w must resolve through the platform man; -k and -t depend on the
-        # mandoc provider (no whatis database, no -t mode) and are best effort.
+      - name: pty 下的透传入口与平台 man 一致（-w / -k / -t）
+        # -w 比较 stdout 字节与退出码；-k 设 WHATISPAGER=cat 后比较 stdout 与
+        # 退出码；-t 的 PostScript 含时间戳，只比退出码与 %!PS 头。
+        env:
+          MANWIDTH: "80"
+          LC_ALL: C
         run: |
-          script -qec "./target/release/man-ai -w ls" /dev/null | grep -q .
-          script -qec "./target/release/man-ai -k ls" /dev/null || true
-          script -qec "./target/release/man-ai -t ls" /dev/null || true
+          set -eu
+          ours=./target/release/man-ai
+
+          man_code=0; ours_code=0
+          script -qec "man -w ls" /dev/null > /tmp/man-w.out || man_code=$?
+          script -qec "$ours -w ls" /dev/null > /tmp/ours-w.out || ours_code=$?
+          [ "$ours_code" -eq "$man_code" ]
+          cmp /tmp/man-w.out /tmp/ours-w.out
+
+          man_code=0; ours_code=0
+          script -qec "WHATISPAGER=cat man -k ls" /dev/null > /tmp/man-k.out || man_code=$?
+          script -qec "WHATISPAGER=cat $ours -k ls" /dev/null > /tmp/ours-k.out || ours_code=$?
+          [ "$ours_code" -eq "$man_code" ]
+          cmp /tmp/man-k.out /tmp/ours-k.out
+
+          man_code=0; ours_code=0
+          script -qec "man -t ls" /dev/null > /tmp/man-t.out || man_code=$?
+          script -qec "$ours -t ls" /dev/null > /tmp/ours-t.out || ours_code=$?
+          [ "$ours_code" -eq "$man_code" ]
+          if [ "$man_code" -eq 0 ]; then
+            head -c 5 /tmp/man-t.out | grep -qx '%!PS'
+            head -c 5 /tmp/ours-t.out | grep -qx '%!PS'
+          fi
