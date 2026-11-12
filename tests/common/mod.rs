@@ -210,6 +210,14 @@ fn strip_carriage_returns(bytes: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// 在 pty 下跑一条 shell 命令，输出去掉 pty 的 `\r`；#24 差分用。
+///
+/// 命令自己负责重定向 stderr（通常重定向到 `dir.file(...)`），因为这里只回传 pty 输出。
+pub fn run_pty_command(dir: &TempDir, script: &str, extra_env: &[(&str, &str)]) -> (Vec<u8>, i32) {
+    let run = run_pty_script_with(dir, script, extra_env, |_| {});
+    (strip_carriage_returns(run.output), run.code)
+}
+
 /// 薄壳模式 + stdout 是 TTY：stdin/stdout 都在 pty 上，stderr 重定向到文件。
 pub fn run_shell_tty(dir: &TempDir, args: &[&str], extra_env: &[(&str, &str)]) -> PtyRun {
     let stderr_file = dir.file("stderr.txt");
@@ -390,6 +398,8 @@ pub enum Reply {
     Raw(u16, String),
     /// 睡一段时间再回 200 + JSON（用于触发客户端超时）。
     Delay(Duration, Value),
+    /// 等指定文件出现再回 200 + JSON：让慢块由测试观察到的同步信号放行，而不是固定计时窗口。
+    AwaitFile(PathBuf, Duration, Value),
 }
 
 #[derive(Clone, Debug)]
@@ -508,6 +518,13 @@ async fn handle_model_request(State(state): State<Arc<ModelState>>, request: Req
         Reply::Raw(code, body) => (status(code), body).into_response(),
         Reply::Delay(delay, value) => {
             tokio::time::sleep(delay).await;
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Reply::AwaitFile(path, timeout, value) => {
+            let deadline = tokio::time::Instant::now() + timeout;
+            while !path.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             (StatusCode::OK, Json(value)).into_response()
         }
     };

@@ -60,15 +60,21 @@ fn 首屏在全部块完成前启动且按序_flush() {
     let mut script = echo_script(&names);
     let slow = names.last().unwrap().clone();
     script.retain(|(key, _)| *key != format!("{slow}\n"));
-    script.push((
-        format!("{slow}\n"),
-        Reply::Delay(Duration::from_secs(5), completion("t29\n", "stop")),
-    ));
-    let model = FakeModel::start_by_content(script);
     let dir = TempDir::new("t21-first-screen");
-    dir.write_config(&model_config_with(&model, 4, ""));
     let pager = recording_pager(&dir, "screen");
     let start = dir.file("screen.start");
+    // 慢块等到分页器标记文件出现才应答：用同步信号代替固定计时窗口，
+    // 高负载下不会误判，正确实现下也几乎不增加测试时长。
+    script.push((
+        format!("{slow}\n"),
+        Reply::AwaitFile(
+            start.clone(),
+            Duration::from_secs(30),
+            completion("t29\n", "stop"),
+        ),
+    ));
+    let model = FakeModel::start_by_content(script);
+    dir.write_config(&model_config_with(&model, 4, ""));
     let seen = Arc::new(AtomicBool::new(false));
     let flag = seen.clone();
     let run = run_pager_tty_with_pid(
@@ -77,7 +83,7 @@ fn 首屏在全部块完成前启动且按序_flush() {
         page(&names).as_bytes(),
         &[("MAN_AI_PAGER", pager.to_str().unwrap())],
         move |_pid| {
-            if wait_for(&start, Duration::from_millis(3000)) {
+            if wait_for(&start, Duration::from_secs(15)) {
                 flag.store(true, Ordering::SeqCst);
             }
         },
