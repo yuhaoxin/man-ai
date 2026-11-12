@@ -12,10 +12,10 @@ class ManAi < Formula
   license "MIT"
 
   if Hardware::CPU.arm?
-    url "https://github.com/yuhaoxin/man-ai/releases/download/v#{version}/man-ai-v#{version}-aarch64-apple-darwin.tar.gz"
+    url "https://github.com/yuhaoxin/man-ai/releases/download/v#{version}/man-ai-aarch64-apple-darwin.tar.gz"
     sha256 "ARM64_SHA256"
   else
-    url "https://github.com/yuhaoxin/man-ai/releases/download/v#{version}/man-ai-v#{version}-x86_64-apple-darwin.tar.gz"
+    url "https://github.com/yuhaoxin/man-ai/releases/download/v#{version}/man-ai-x86_64-apple-darwin.tar.gz"
     sha256 "X86_64_SHA256"
   end
 

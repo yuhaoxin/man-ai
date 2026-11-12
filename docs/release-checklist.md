@@ -24,7 +24,7 @@ cargo dist plan
 cargo dist build --artifacts=local
 ```
 
-`cargo dist plan` 应列出且只列出四个 target 的 `.tar.gz` 与 `.sha256`：
+`cargo dist plan` 应列出且只列出四个 target 的 `<app>-<target>.tar.gz` 与 `.sha256`：
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
@@ -34,8 +34,8 @@ cargo dist build --artifacts=local
 逐个解包确认产物只含 `man-ai` 二进制：没有 shell 补全、没有 man 手册、没有 README/LICENSE、没有源码 tarball。
 
 ```sh
-tar -tzf man-ai-<version>-<target>.tar.gz
-shasum -a 256 -c man-ai-<version>-<target>.tar.gz.sha256   # Linux: sha256sum -c
+tar -tzf man-ai-<target>.tar.gz
+shasum -a 256 -c man-ai-<target>.tar.gz.sha256   # Linux: sha256sum -c
 ```
 
 ## 3. 发布与 tap
@@ -87,10 +87,10 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。�
 
 ```sh
 # Fresh machine or clean PATH:
-curl -fLO .../man-ai-<version>-<target>.tar.gz
-shasum -a 256 -c man-ai-<version>-<target>.tar.gz.sha256
-tar -xzf man-ai-<version>-<target>.tar.gz
-export MANPAGER="$PWD/man-ai-<version>-<target>/man-ai"
+curl -fLO .../man-ai-<target>.tar.gz
+shasum -a 256 -c man-ai-<target>.tar.gz.sha256
+tar -xzf man-ai-<target>.tar.gz
+export MANPAGER="$PWD/man-ai-<target>/man-ai"
 man ls
 ```
 

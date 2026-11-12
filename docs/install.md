@@ -26,22 +26,22 @@ cargo install --path .
 
 ### 2. GitHub Release tarball
 
-Release 资产是 `man-ai-<version>-<target>.tar.gz` 与同名的 `.sha256`，由 cargo-dist 生成，包内只有一个 `man-ai` 二进制（无 shell 补全、无 man 手册）。
+Release 资产是 `man-ai-<target>.tar.gz` 与该文件的 `.sha256`（cargo-dist 的命名不带版本号，版本由 Release 的 tag 区分），包内只有一个 `man-ai` 二进制（无 shell 补全、无 man 手册）。解压后是 `man-ai-<target>/` 目录。
 
 ```sh
 VERSION=0.1.0
 TARGET=aarch64-apple-darwin   # 换成上表中的 target
 base="https://github.com/yuhaoxin/man-ai/releases/download/v${VERSION}"
-curl -fLO "${base}/man-ai-v${VERSION}-${TARGET}.tar.gz"
-curl -fLO "${base}/man-ai-v${VERSION}-${TARGET}.tar.gz.sha256"
+curl -fLO "${base}/man-ai-${TARGET}.tar.gz"
+curl -fLO "${base}/man-ai-${TARGET}.tar.gz.sha256"
 
 # 校验：macOS 用 shasum，Linux 用 sha256sum
-shasum -a 256 -c "man-ai-v${VERSION}-${TARGET}.tar.gz.sha256"
-# sha256sum -c "man-ai-v${VERSION}-${TARGET}.tar.gz.sha256"
+shasum -a 256 -c "man-ai-${TARGET}.tar.gz.sha256"
+# sha256sum -c "man-ai-${TARGET}.tar.gz.sha256"
 
-tar -xzf "man-ai-v${VERSION}-${TARGET}.tar.gz"
+tar -xzf "man-ai-${TARGET}.tar.gz"
 mkdir -p ~/.local/bin
-install -m 755 "man-ai-v${VERSION}-${TARGET}/man-ai" ~/.local/bin/man-ai
+install -m 755 "man-ai-${TARGET}/man-ai" ~/.local/bin/man-ai
 ```
 
 `~/.local/bin` 需要在 `PATH` 里。
