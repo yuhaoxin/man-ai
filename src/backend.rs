@@ -75,6 +75,8 @@ pub struct Completion {
 /// 已规范化的后端：endpoint、model、密钥与 HTTP client。
 pub struct Backend {
     client: Client<OpenAIConfig>,
+    /// 配置原值；缓存键里用它的规范化形式（§9.1）。
+    endpoint: String,
     model: String,
     max_tokens: Option<u32>,
 }
@@ -118,9 +120,15 @@ impl Backend {
         let client = Client::with_config(openai).with_http_service(ReqwestService::new(http));
         Ok(Self {
             client,
+            endpoint: endpoint.to_string(),
             model: model.to_string(),
             max_tokens: config.max_tokens,
         })
+    }
+
+    /// 缓存键需要的后端身份：端点配置原值与模型名。
+    pub fn key_parts(&self) -> (&str, &str) {
+        (&self.endpoint, &self.model)
     }
 
     /// 单次尝试（§7.1、§10.3）。

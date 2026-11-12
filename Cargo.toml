@@ -8,9 +8,12 @@ description = "Translate rendered man pages into a target language"
 
 [dependencies]
 async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "rustls", "middleware"] }
+blake3 = "1.8.7"
 futures = "0.3.34"
+libc = "0.2.191"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks"] }
 signal-hook = "0.4.6"
+tempfile = "3.27.0"
 terminal_size = "0.4.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "1.2.1"

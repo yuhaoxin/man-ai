@@ -4,9 +4,11 @@
 //! #19 加入语言来源链、显示名与配置文件解析。
 //! #20 加入切块、提示词、OpenAI 兼容后端、结构校验与串行翻译管线。
 //! #21 加入按序并发、首屏流式、EPIPE 提前退出与两阶段 SIGINT。
+//! #22 加入块级内容寻址缓存。
 
 pub mod backend;
 pub mod blocks;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod language;

@@ -9,6 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::backend::Backend;
+use crate::cache;
 use crate::config::Config;
 use crate::language::Language;
 use crate::translate::PipelineCtx;
@@ -55,6 +56,13 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
 ///
 /// 捕获为空时不动输出，只透传 man 的 stderr（继承）与退出码。
 fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -> i32 {
+    // §9.5：捕获 man 输出之前剪枝。
+    let (cache, cache_warning) = cache::open(config);
+    if let Some(line) = cache_warning {
+        eprintln!("man-ai: {line}");
+    }
+    cache.prune(config.cache_max_mb);
+
     let output = Command::new("man")
         .args(&own.rest)
         .env("MANPAGER", "cat")
@@ -92,6 +100,7 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
     let ctx = PipelineCtx {
         lang,
         backend: backend.as_ref(),
+        cache: &cache,
         concurrency: config.concurrency,
     };
     if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out)) {

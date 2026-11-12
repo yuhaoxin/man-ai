@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::process::exit;
 
 use man_ai::backend::Backend;
+use man_ai::cache::{self, Cache};
 use man_ai::language::Language;
 use man_ai::translate::PipelineCtx;
 use man_ai::{blocks, cli, config, output, pager, shellmode, translate};
@@ -91,6 +92,22 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
         }
     }
 
+    // §5.2 第 3 条：确定要走翻译路径时，读 stdin 之前剪枝。
+    let will_translate = !lang.is_english()
+        && own.translate != Some(false)
+        && (io::stdout().is_terminal() || own.translate == Some(true));
+    let (cache, cache_warning) = if will_translate {
+        cache::open(&loaded.config)
+    } else {
+        (Cache::disabled(), None)
+    };
+    if let Some(line) = cache_warning {
+        eprintln!("man-ai: {line}");
+    }
+    if will_translate {
+        cache.prune(loaded.config.cache_max_mb);
+    }
+
     let mut input = Vec::new();
     let _ = io::stdin().read_to_end(&mut input);
     let page = blocks::split(&input);
@@ -120,6 +137,7 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
     let ctx = PipelineCtx {
         lang: &lang,
         backend: backend.as_ref(),
+        cache: &cache,
         concurrency: loaded.config.concurrency,
     };
     let outcome = match translate::block_on(translate::run_page(page, ctx, &mut out)) {

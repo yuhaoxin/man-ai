@@ -13,6 +13,7 @@ use futures::stream;
 
 use crate::backend::{Backend, Completion, Failure, Reason};
 use crate::blocks::{Block, SplitPage};
+use crate::cache::{Cache, Form, KeyParts};
 use crate::language::Language;
 use crate::output::Out;
 use crate::{prompt, validate};
@@ -29,6 +30,8 @@ pub struct PipelineCtx<'a> {
     pub lang: &'a Language,
     /// `None` 表示后端未配置：不发请求，全部回退原文。
     pub backend: Option<&'a Backend>,
+    /// 块级内容寻址缓存；关闭或不可用时内部 no-op。
+    pub cache: &'a Cache,
     /// 在途请求上限（§8.1）；取值已由配置校验，至少 1。
     pub concurrency: usize,
 }
@@ -106,6 +109,16 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let mut deterministic = false;
 
     let backend = ctx.backend;
+    let cache = ctx.cache;
+    let lang_tag = ctx.lang.tag();
+    let parts = backend.map(|backend| {
+        let (endpoint, model) = backend.key_parts();
+        KeyParts {
+            lang: lang_tag,
+            endpoint,
+            model,
+        }
+    });
     let system = system.as_str();
     let stop_ref = &stop;
     let interrupt_ref = &interrupt;
@@ -122,12 +135,31 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                 stop_ref.store(true, Ordering::Relaxed);
                 return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
             };
+            /* 命中直接采用，不发请求、不重新校验（§9.3）。 */
+            if let Some(parts) = parts {
+                if let Some(hit) = cache
+                    .get(Form::Page, &parts, &block.raw)
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                {
+                    return BlockResult {
+                        block,
+                        translation: Some(hit),
+                        failure: None,
+                    };
+                }
+            }
             match translate_block(backend, system, &text, stop_ref, interrupt_ref).await {
-                Ok(translation) => BlockResult {
-                    block,
-                    translation: Some(translation),
-                    failure: None,
-                },
+                Ok(translation) => {
+                    /* 采用后立即写，与写出顺序无关（§9.3）。 */
+                    if let Some(parts) = parts {
+                        cache.put(Form::Page, &parts, &block.raw, translation.as_bytes());
+                    }
+                    BlockResult {
+                        block,
+                        translation: Some(translation),
+                        failure: None,
+                    }
+                }
                 Err(failure) => {
                     /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
                     if stops_submission(&failure) {
@@ -166,6 +198,9 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
             None => &result.block.raw,
         };
         out.write_block(&result.block, body)?;
+        if let Some(line) = ctx.cache.take_warning() {
+            out.diagnostic(&line);
+        }
         /* 分页器提前退出：丢弃在途请求、停止写入（§8.2）。 */
         if out.broken() {
             break;
