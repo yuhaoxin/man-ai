@@ -76,9 +76,17 @@ pub fn write_script(path: &Path, body: &str) {
 }
 
 /// 指向假模型服务的配置文件内容。
+///
+/// 默认 `concurrency = 1`：#20 的脚本化应答按请求到达顺序对应块，只有串行时
+/// 这个对应关系才确定；#21 的并发测试用 [`model_config_with`]。
 pub fn model_config(model: &FakeModel, extra: &str) -> String {
+    model_config_with(model, 1, extra)
+}
+
+/// 指定并发度的配置内容。
+pub fn model_config_with(model: &FakeModel, concurrency: usize, extra: &str) -> String {
     format!(
-        "endpoint = \"{}/\"\nmodel = \"test-model\"\napi_key = \"sk-test\"\n{extra}",
+        "endpoint = \"{}/\"\nmodel = \"test-model\"\napi_key = \"sk-test\"\nconcurrency = {concurrency}\n{extra}",
         model.endpoint()
     )
 }
@@ -152,6 +160,17 @@ pub fn run_pager_tty(
     stdin: &[u8],
     extra_env: &[(&str, &str)],
 ) -> PtyRun {
+    run_pager_tty_with_pid(dir, args, stdin, extra_env, |_| {})
+}
+
+/// 同上，但在读输出期间把 man-ai 的 pid 交给 `hook`（发信号、等文件标记用）。
+pub fn run_pager_tty_with_pid(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, &str)],
+    hook: impl FnOnce(u32) + Send + 'static,
+) -> PtyRun {
     let input = dir.file("stdin.bin");
     fs::write(&input, stdin).unwrap();
     let stderr_file = dir.file("stderr.txt");
@@ -168,7 +187,7 @@ pub fn run_pager_tty(
     ));
     let mut extra = vec![("MAN_AI_PAGER", "cat")];
     extra.extend_from_slice(extra_env);
-    let run = run_pty_script(dir, &script, &extra);
+    let run = run_pty_script_with(dir, &script, &extra, hook);
     PtyRun {
         output: strip_carriage_returns(run.output),
         stderr: fs::read_to_string(&stderr_file).unwrap_or_default(),
@@ -220,6 +239,15 @@ struct RawPtyRun {
 }
 
 fn run_pty_script(dir: &TempDir, script: &str, extra_env: &[(&str, &str)]) -> RawPtyRun {
+    run_pty_script_with(dir, script, extra_env, |_| {})
+}
+
+fn run_pty_script_with(
+    dir: &TempDir,
+    script: &str,
+    extra_env: &[(&str, &str)],
+    hook: impl FnOnce(u32) + Send + 'static,
+) -> RawPtyRun {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -241,11 +269,59 @@ fn run_pty_script(dir: &TempDir, script: &str, extra_env: &[(&str, &str)]) -> Ra
     }
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
+    let pid = child.process_id();
+    let background = pid.map(|pid| std::thread::spawn(move || hook(pid)));
     let mut reader = pair.master.try_clone_reader().unwrap();
     let mut output = Vec::new();
     reader.read_to_end(&mut output).unwrap();
     let code = child.wait().unwrap().exit_code() as i32;
+    if let Some(background) = background {
+        let _ = background.join();
+    }
     RawPtyRun { output, code }
+}
+
+// ---------------------------------------------------------------- 假分页器
+
+/// 边读边记录的内层分页器：启动时写 `<name>.start` 标记（证明首屏），
+/// 每读到一行同时追加到 `<name>.log` 并回显到 stdout。
+pub fn recording_pager(dir: &TempDir, name: &str) -> PathBuf {
+    let start = dir.file(&format!("{name}.start"));
+    let log = dir.file(&format!("{name}.log"));
+    let path = dir.file(&format!("{name}-pager"));
+    write_script(
+        &path,
+        &format!(
+            "#!/bin/sh\necho started > '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  printf '%s\\n' \"$line\"\ndone\n",
+            start.display(),
+            log.display()
+        ),
+    );
+    path
+}
+
+/// 只读一个字节就退出的分页器：用于 EPIPE（退出码 7）。
+pub fn quitting_pager(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.file(&format!("{name}-pager"));
+    write_script(&path, "#!/bin/sh\nhead -c 1 >/dev/null\nexit 7\n");
+    path
+}
+
+/// 记录分页器收到的行（含页首/尾行，pty 的 `\r\n` 已归一）。
+pub fn pager_log(dir: &TempDir, name: &str) -> Vec<String> {
+    fs::read_to_string(dir.file(&format!("{name}.log")))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// 往进程发 SIGINT；`/bin/kill` 在 macOS 与 Linux 都有。
+pub fn send_sigint(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 // ---------------------------------------------------------------- 假 man
@@ -292,7 +368,11 @@ pub struct Recorded {
 
 struct ModelState {
     replies: Mutex<VecDeque<Reply>>,
+    /// 按请求里的 user 内容应答；与请求到达顺序无关，用于并发测试。
+    script: std::collections::HashMap<String, Reply>,
     requests: Mutex<Vec<Recorded>>,
+    in_flight: AtomicU32,
+    peak: AtomicU32,
 }
 
 pub struct FakeModel {
@@ -303,10 +383,22 @@ pub struct FakeModel {
 
 impl FakeModel {
     pub fn start(replies: Vec<Reply>) -> Self {
+        Self::start_with(replies, Vec::new())
+    }
+
+    /// 按请求内容应答：同一内容每次得到同一响应，适合并发下的顺序断言。
+    pub fn start_by_content(script: Vec<(String, Reply)>) -> Self {
+        Self::start_with(Vec::new(), script)
+    }
+
+    fn start_with(replies: Vec<Reply>, script: Vec<(String, Reply)>) -> Self {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let state = Arc::new(ModelState {
             replies: Mutex::new(VecDeque::from(replies)),
+            script: script.into_iter().collect(),
             requests: Mutex::new(Vec::new()),
+            in_flight: AtomicU32::new(0),
+            peak: AtomicU32::new(0),
         });
         let endpoint = runtime.block_on({
             let state = state.clone();
@@ -340,6 +432,11 @@ impl FakeModel {
     pub fn count(&self) -> usize {
         self.state.requests.lock().unwrap().len()
     }
+
+    /// 观察到的最大在途请求数（并发上限断言用）。
+    pub fn peak_in_flight(&self) -> usize {
+        self.state.peak.load(Ordering::SeqCst) as usize
+    }
 }
 
 async fn handle_model_request(State(state): State<Arc<ModelState>>, request: Request) -> Response {
@@ -352,22 +449,26 @@ async fn handle_model_request(State(state): State<Arc<ModelState>>, request: Req
         .map(str::to_string);
     let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let key = body["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     state.requests.lock().unwrap().push(Recorded {
         method,
         path,
         authorization,
         body,
     });
-    let reply = state
-        .replies
-        .lock()
-        .unwrap()
-        .pop_front()
+    let scripted = state.script.get(&key).cloned();
+    let reply = scripted
+        .or_else(|| state.replies.lock().unwrap().pop_front())
         .unwrap_or(Reply::Status(
             500,
             json!({"error": {"message": "no reply scripted"}}),
         ));
-    match reply {
+    let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    state.peak.fetch_max(now, Ordering::SeqCst);
+    let response = match reply {
         Reply::Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Reply::Status(code, value) => (status(code), Json(value)).into_response(),
         Reply::Raw(code, body) => (status(code), body).into_response(),
@@ -375,7 +476,9 @@ async fn handle_model_request(State(state): State<Arc<ModelState>>, request: Req
             tokio::time::sleep(delay).await;
             (StatusCode::OK, Json(value)).into_response()
         }
-    }
+    };
+    state.in_flight.fetch_sub(1, Ordering::SeqCst);
+    response
 }
 
 fn status(code: u16) -> StatusCode {

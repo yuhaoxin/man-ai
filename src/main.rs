@@ -116,16 +116,17 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
     };
 
     let tty = io::stdout().is_terminal();
-    let mut out = output::Out::new(tty);
+    let mut out = output::Out::new(tty, own.rest.clone());
     let ctx = PipelineCtx {
         lang: &lang,
         backend: backend.as_ref(),
+        concurrency: loaded.config.concurrency,
     };
     let outcome = match translate::block_on(translate::run_page(page, ctx, &mut out)) {
         Ok(outcome) => outcome,
         Err(_) => return 0,
     };
-    if !tty && outcome.all_failed() {
+    if !tty && outcome.all_failed() && !out.broken() {
         if let Some(reason) = outcome.reason {
             eprintln!(
                 "man-ai: translation failed ({}), showing the original below",
@@ -133,7 +134,7 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
             );
         }
     }
-    out.finish(&own.rest).unwrap_or(0)
+    out.finish().unwrap_or(0)
 }
 
 /// 原文直通：TTY 走内层分页器链，非 TTY 直写 stdout（§5.2 第 5 条）。

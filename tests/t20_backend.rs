@@ -76,8 +76,9 @@ fn 每块一次请求且本地端点用裸_bearer() {
     ]);
     let dir = TempDir::new("bare-bearer");
     // 本地端点不带 api_key。
+    // 脚本化应答按请求到达顺序对应块，只有串行时这个对应关系才确定。
     dir.write_config(&format!(
-        "endpoint = \"{}/\"\nmodel = \"test-model\"\n",
+        "endpoint = \"{}/\"\nmodel = \"test-model\"\nconcurrency = 1\n",
         model.endpoint()
     ));
     let run = translate(&dir, b"a\n\nb\n");

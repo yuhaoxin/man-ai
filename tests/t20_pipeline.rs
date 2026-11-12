@@ -8,6 +8,7 @@ use common::{
 
 const LANG: &str = "zh-CN";
 const HEADER: &str = "── man-ai: translation (Simplified Chinese) ──\n\n";
+const PROGRESS: &str = "man-ai: translating (Simplified Chinese)…\n";
 
 #[test]
 fn 全部采用时页首行与尾行() {
@@ -24,7 +25,8 @@ fn 全部采用时页首行与尾行() {
         format!("{HEADER}甲\n\n乙\n\n── man-ai: translated (Simplified Chinese) ──\n")
     );
     assert_eq!(model.count(), 2);
-    assert!(run.stderr.is_empty(), "{}", run.stderr);
+    // §8.4：首个块写出、分页器尚未启动时提示一行。
+    assert_eq!(run.stderr, PROGRESS);
 }
 
 #[test]
@@ -85,7 +87,7 @@ fn 未配置后端全部原文并写尾行() {
     );
     assert_eq!(
         run.stderr,
-        "man-ai: backend not configured (missing model); not translating\n"
+        format!("man-ai: backend not configured (missing model); not translating\n{PROGRESS}")
     );
 }
 

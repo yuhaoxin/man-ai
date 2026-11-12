@@ -88,10 +88,11 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
             None
         }
     };
-    let mut out = output::Out::new(false);
+    let mut out = output::Out::new(false, Vec::new());
     let ctx = PipelineCtx {
         lang,
         backend: backend.as_ref(),
+        concurrency: config.concurrency,
     };
     if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out)) {
         if outcome.all_failed() {
@@ -103,7 +104,7 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
             }
         }
     }
-    let _ = out.finish(&[]);
+    let _ = out.finish();
     code
 }
 

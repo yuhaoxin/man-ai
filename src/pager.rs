@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
 /// 链路最后的候选。
 pub const DEFAULT: &str = "less -sR";
@@ -143,11 +143,17 @@ pub fn resolve() -> Option<Chain> {
 ///
 /// 分页器提前退出导致的写失败按 EPIPE 处理：停止写入，仍等子进程并透传其退出码。
 pub fn pipe(chain: &Chain, extra: &[OsString], data: &[u8]) -> io::Result<i32> {
-    let mut child = spawn(chain, extra)?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(data);
-    }
+    let (mut child, mut stdin) = start(chain, extra)?;
+    let _ = stdin.write_all(data);
+    drop(stdin);
     child.wait().map(exit_code)
+}
+
+/// 只启动内层分页器：调用方持有 stdin 写端，边写边 flush，写完关闭再 `wait`。
+pub fn start(chain: &Chain, extra: &[OsString]) -> io::Result<(Child, ChildStdin)> {
+    let mut child = spawn(chain, extra)?;
+    let stdin = child.stdin.take().expect("pager stdin is piped");
+    Ok((child, stdin))
 }
 
 fn spawn(chain: &Chain, extra: &[OsString]) -> io::Result<Child> {
