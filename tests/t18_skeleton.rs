@@ -474,7 +474,12 @@ fn 分页器链追加剩余_argv_并原样直通() {
     let dir = TempDir::new("pager-args");
     let pager = fake_pager(dir.path(), "pager", 0);
     let extra = [("MAN_AI_PAGER", pager.to_str().unwrap())];
-    let pty = run_pager_mode(&dir, "--lang ja -X -- --translate", &extra, "page line\n");
+    let pty = run_pager_mode(
+        &dir,
+        "--lang ja --no-translate -X -- --translate",
+        &extra,
+        "page line\n",
+    );
     assert_eq!(pty.code, 0);
     assert_eq!(pty_text(&pty.output), "page line\n");
     assert_eq!(

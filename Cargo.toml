@@ -7,8 +7,12 @@ license = "MIT"
 description = "Translate rendered man pages into a target language"
 
 [dependencies]
+async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "rustls", "middleware"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "1.2.1"
 
 [dev-dependencies]
+axum = "0.8.9"
 portable-pty = "0.9.0"
+serde_json = "1.0.154"

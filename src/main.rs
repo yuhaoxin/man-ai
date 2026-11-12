@@ -5,8 +5,10 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::exit;
 
+use man_ai::backend::Backend;
 use man_ai::language::Language;
-use man_ai::{cli, config, pager, shellmode};
+use man_ai::translate::PipelineCtx;
+use man_ai::{blocks, cli, config, output, pager, shellmode, translate};
 
 const HELP: &str = "\
 Usage: man-ai [--lang <tag>] [--translate | --no-translate] [man arguments...]
@@ -74,8 +76,6 @@ fn resolve_lang(own: &cli::OwnArgs) -> Result<Option<Language>, i32> {
 }
 
 /// 分页器模式：先解析配置与语言并输出告警，再读完 stdin 决定输出路径（§5.2）。
-///
-/// 本票没有翻译路径，原文按内层分页器链或 stdout 输出。
 fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
     let loaded = config::load(config::config_path().as_deref());
     let config_lang = loaded
@@ -93,20 +93,60 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
 
     let mut input = Vec::new();
     let _ = io::stdin().read_to_end(&mut input);
+    let page = blocks::split(&input);
 
-    // #20 在这个判定为真时接翻译链路；眼下两条路径都原文直通。
-    let _translate = !lang.is_english() && own.translate != Some(false);
+    // §5.2 第 5 条：en、--no-translate、非 TTY 且没有 --translate、0 块都原文直通。
+    let to_translate = io::stdout().is_terminal() || own.translate == Some(true);
+    let translate_page = !lang.is_english()
+        && own.translate != Some(false)
+        && to_translate
+        && !page.blocks.is_empty();
+    if !translate_page {
+        return output_original(own, &input);
+    }
 
+    let backend = match Backend::from_config(&loaded.config) {
+        Ok(backend) => Some(backend),
+        Err(failure) => {
+            if let Some(line) = failure.diagnostic {
+                eprintln!("man-ai: {line}");
+            }
+            None
+        }
+    };
+
+    let tty = io::stdout().is_terminal();
+    let mut out = output::Out::new(tty);
+    let ctx = PipelineCtx {
+        lang: &lang,
+        backend: backend.as_ref(),
+    };
+    let outcome = match translate::block_on(translate::run_page(page, ctx, &mut out)) {
+        Ok(outcome) => outcome,
+        Err(_) => return 0,
+    };
+    if !tty && outcome.all_failed() {
+        if let Some(reason) = outcome.reason {
+            eprintln!(
+                "man-ai: translation failed ({}), showing the original below",
+                reason.as_str()
+            );
+        }
+    }
+    out.finish(&own.rest).unwrap_or(0)
+}
+
+/// 原文直通：TTY 走内层分页器链，非 TTY 直写 stdout（§5.2 第 5 条）。
+fn output_original(own: &cli::OwnArgs, input: &[u8]) -> i32 {
     if io::stdout().is_terminal() {
         if let Some(chain) = pager::resolve() {
-            if let Ok(code) = pager::pipe(&chain, &own.rest, &input) {
+            if let Ok(code) = pager::pipe(&chain, &own.rest, input) {
                 return code;
             }
         }
     }
-
     let mut out = io::stdout().lock();
-    let _ = out.write_all(&input);
+    let _ = out.write_all(input);
     let _ = out.flush();
     0
 }

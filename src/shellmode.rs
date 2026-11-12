@@ -4,10 +4,15 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use crate::{cli, pager};
+use crate::backend::Backend;
+use crate::config::Config;
+use crate::language::Language;
+use crate::translate::PipelineCtx;
+use crate::{blocks, cli, config, output, pager, translate};
 
 /// `-P` 让路时写到 stderr 的一行（§4.3）。程序输出一律英文。
 pub const PAGER_OVERRIDE_NOTE: &str = "man-ai: -P overrides MANPAGER; not translating";
@@ -24,11 +29,82 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
     if scan.passthrough {
         return exec_man(&own.rest);
     }
-    // -k/-f 拦截（§5.4）与非 TTY 的 --translate 捕获（§5.3）由后续票接入，
-    // 本票两条路径都只透传。
+    // §5.3：非 TTY 的 --translate 捕获 man 输出后翻译。-k/-f 拦截留给 #23。
+    if own.translate == Some(true) && !scan.kf && !io::stdout().is_terminal() {
+        let loaded = config::load(config::config_path().as_deref());
+        let cli_lang = lang.and_then(|raw| Language::parse_cli(raw).ok());
+        let config_lang = loaded
+            .config
+            .lang
+            .as_deref()
+            .and_then(Language::from_config);
+        let language = Language::resolve(cli_lang, config_lang);
+        if !language.is_english() {
+            for warning in &loaded.warnings {
+                eprintln!("{warning}");
+            }
+            return capture_and_translate(own, &language, &loaded.config);
+        }
+    }
     save_manpager();
     set_env("MANPAGER", manpager_value(lang, own.translate));
     exec_man(&own.rest)
+}
+
+/// 非 TTY 的 `--translate`：设子进程 `MANPAGER=cat` 捕获 man 输出再翻译（§5.3）。
+///
+/// 捕获为空时不动输出，只透传 man 的 stderr（继承）与退出码。
+fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -> i32 {
+    let output = Command::new("man")
+        .args(&own.rest)
+        .env("MANPAGER", "cat")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => return 127,
+    };
+    let code = pager::exit_code(output.status);
+    if output.stdout.is_empty() {
+        return code;
+    }
+
+    let page = blocks::split(&output.stdout);
+    if page.blocks.is_empty() {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(&output.stdout);
+        let _ = stdout.flush();
+        return code;
+    }
+
+    let backend = match Backend::from_config(config) {
+        Ok(backend) => Some(backend),
+        Err(failure) => {
+            if let Some(line) = failure.diagnostic {
+                eprintln!("man-ai: {line}");
+            }
+            None
+        }
+    };
+    let mut out = output::Out::new(false);
+    let ctx = PipelineCtx {
+        lang,
+        backend: backend.as_ref(),
+    };
+    if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out)) {
+        if outcome.all_failed() {
+            if let Some(reason) = outcome.reason {
+                eprintln!(
+                    "man-ai: translation failed ({}), showing the original below",
+                    reason.as_str()
+                );
+            }
+        }
+    }
+    let _ = out.finish(&[]);
+    code
 }
 
 /// `MANPAGER="man-ai [--lang <规范标签>] [--translate|--no-translate]"`（§4.2）。
