@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "把平台 man 的渲染结果翻译成目标语言"
+description = "Translate rendered man pages into a target language"
 
 [dependencies]
 

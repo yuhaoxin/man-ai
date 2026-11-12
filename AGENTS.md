@@ -2,7 +2,7 @@
 
 ### Output language
 
-This is a public project. Everything the program prints to stdout or stderr MUST be in English: `--help` and usage text, usage errors, configuration warnings, diagnostics, header and tail lines, progress lines, and the five failure reasons. Language display names are printed in their English form. Configuration templates and example config files also use English key descriptions and comments. Documentation and code comments stay in Chinese per the global rules; tests assert the English strings exactly.
+This is a public project. Everything the program prints to stdout or stderr MUST be in English: `--help` and usage text, usage errors, configuration warnings, diagnostics, header and tail lines, progress lines, and the five failure reasons. Language display names are printed in their English form. Configuration templates and example config files also use English key descriptions and comments. Project configuration metadata and descriptions use English too: the Cargo package description, workflow names, and dist/deny config descriptions. Documentation and code comments stay in Chinese per the global rules; tests assert the English strings exactly.
 
 ### Issue tracker
 
