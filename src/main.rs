@@ -14,8 +14,8 @@ use man_ai::{blocks, cli, config, output, pager, shellmode, translate};
 const HELP: &str = "\
 Usage: man-ai [--lang <tag>] [--translate | --no-translate] [man arguments...]
 
-man-ai is a thin shell and pager around man: pages are rendered by the platform
-man and translated into the language chosen by --lang.
+man-ai wraps man through MANPAGER: pages are rendered by the platform man and
+translated into the language chosen by --lang.
 
 Own arguments:
   --help          show this help and exit

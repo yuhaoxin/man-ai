@@ -80,11 +80,12 @@ impl Cache {
         let Some(key) = key(form, parts, input) else {
             return;
         };
-        if write_atomic(&state.root, &entry(&state.root, &key), value).is_err()
-            && let Ok(mut slot) = state.warning.lock()
-            && slot.is_none()
-        {
-            *slot = Some("cache write failed; continuing without cache".to_string());
+        if write_atomic(&state.root, &entry(&state.root, &key), value).is_err() {
+            if let Ok(mut slot) = state.warning.lock() {
+                if slot.is_none() {
+                    *slot = Some("cache write failed; continuing without cache".to_string());
+                }
+            }
         }
     }
 

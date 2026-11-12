@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use toml::Value;
 
@@ -136,10 +137,12 @@ pub fn load(path: Option<&Path>) -> LoadedConfig {
                     .as_float()
                     .or_else(|| value.as_integer().map(|v| v as f64));
                 match seconds {
-                    Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
+                    // 超大值、inf/nan 与 0 都会被 try_from_secs_f64 拒绝。
+                    Some(seconds)
+                        if Duration::try_from_secs_f64(seconds).is_ok_and(|d| !d.is_zero()) =>
+                    {
                         loaded.config.timeout_seconds = seconds;
                     }
-                    // inf/nan 会让 Duration::from_secs_f64 直接 panic。
                     _ => invalid(&mut loaded.warnings, "timeout_seconds"),
                 }
             }
@@ -215,35 +218,8 @@ fn valid_proxy(raw: &str) -> bool {
 mod tests {
     use super::*;
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static NEXT: AtomicU32 = AtomicU32::new(0);
-            let path = env::temp_dir().join(format!(
-                "man-ai-config-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn file(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn load_toml(dir: &TempDir, text: &str) -> LoadedConfig {
-        let path = dir.file("config.toml");
+    fn load_toml(dir: &tempfile::TempDir, text: &str) -> LoadedConfig {
+        let path = dir.path().join("config.toml");
         fs::write(&path, text).unwrap();
         load(Some(&path))
     }
@@ -264,8 +240,8 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 缺文件与缺路径静默取默认值() {
-        let dir = TempDir::new("missing");
-        let missing = load(Some(&dir.file("nope.toml")));
+        let dir = tempfile::tempdir().unwrap();
+        let missing = load(Some(&dir.path().join("nope.toml")));
         assert!(missing.warnings.is_empty(), "{:?}", missing.warnings);
         assert_eq!(missing.config, Config::default());
 
@@ -290,13 +266,13 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 语法错误告警并整体按默认值() {
-        let dir = TempDir::new("syntax");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(&dir, "endpoint = [unclosed\nlang = \"ja\"\n");
         assert_eq!(
             loaded.warnings,
             vec![format!(
                 "man-ai: failed to parse config ({}); using defaults",
-                dir.file("config.toml").display()
+                dir.path().join("config.toml").display()
             )]
         );
         assert_eq!(loaded.config, Config::default());
@@ -304,7 +280,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 未知键告警其余键照常生效() {
-        let dir = TempDir::new("unknown");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(
             &dir,
             "endpoint = \"https://api.example.com/v1\"\ncolour = \"blue\"\n",
@@ -321,7 +297,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 单键类型不符与越界告警并按默认值() {
-        let dir = TempDir::new("bad");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(
             &dir,
             "concurrency = \"four\"\n\
@@ -347,7 +323,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn endpoint_只接受_http_https_且无查询与片段() {
-        let dir = TempDir::new("endpoint");
+        let dir = tempfile::tempdir().unwrap();
         for raw in [
             "ftp://example.com/v1",
             "https://example.com/v1?key=1",
@@ -372,7 +348,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn proxy_只接受_http_https_socks5() {
-        let dir = TempDir::new("proxy");
+        let dir = tempfile::tempdir().unwrap();
         for raw in ["ftp://p:1", "socks4://p:1", "127.0.0.1:1080"] {
             let loaded = load_toml(&dir, &format!("proxy = \"{raw}\"\n"));
             assert_eq!(
@@ -395,7 +371,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn lang_非法告警并回退_空值不告警() {
-        let dir = TempDir::new("lang");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(&dir, "lang = \"zh CN\"\n");
         assert_eq!(
             loaded.warnings,
@@ -414,7 +390,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 全量合法配置按_规格读入() {
-        let dir = TempDir::new("full");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(&dir, FULL);
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let config = loaded.config;
@@ -436,7 +412,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 整数形式的超时时间也接受() {
-        let dir = TempDir::new("timeout-int");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(&dir, "timeout_seconds = 30\n");
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         assert_eq!(loaded.config.timeout_seconds, 30.0);
@@ -465,7 +441,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 非字符串类型的字符串键逐个告警() {
-        let dir = TempDir::new("types");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(
             &dir,
             "lang = 3\nendpoint = 5\nmodel = 1\napi_key = true\napi_key_env = []\nproxy = 0.5\n",
@@ -488,7 +464,7 @@ proxy = "socks5://127.0.0.1:1080"
 
     #[test]
     fn 空串的字符串键按未设置处理且不告警() {
-        let dir = TempDir::new("empty-strings");
+        let dir = tempfile::tempdir().unwrap();
         let loaded = load_toml(
             &dir,
             "lang = \"\"\nendpoint = \"\"\nmodel = \"\"\n\
@@ -499,9 +475,9 @@ proxy = "socks5://127.0.0.1:1080"
     }
 
     #[test]
-    fn 非有限的超时时间告警并按默认值() {
-        let dir = TempDir::new("timeout-nonfinite");
-        for raw in ["inf", "nan", "-inf"] {
+    fn 无效的超时时间告警并按默认值() {
+        let dir = tempfile::tempdir().unwrap();
+        for raw in ["inf", "nan", "-inf", "0", "1e20"] {
             let loaded = load_toml(&dir, &format!("timeout_seconds = {raw}\n"));
             assert_eq!(
                 loaded.warnings,

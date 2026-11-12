@@ -69,7 +69,8 @@ impl Failure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub content: String,
-    pub finish_reason: Option<String>,
+    /// `finish_reason == "length"`：响应被 `max_tokens` 截断。
+    pub truncated: bool,
 }
 
 /// 已规范化的后端：endpoint、model、密钥与 HTTP client。
@@ -233,19 +234,8 @@ fn completion(response: CreateChatCompletionResponse) -> Result<Completion, Fail
         .ok_or_else(|| Failure::new(Reason::BackendError, true))?;
     Ok(Completion {
         content,
-        finish_reason: choice.finish_reason.map(finish_name),
+        truncated: choice.finish_reason == Some(FinishReason::Length),
     })
-}
-
-fn finish_name(reason: FinishReason) -> String {
-    match reason {
-        FinishReason::Stop => "stop",
-        FinishReason::Length => "length",
-        FinishReason::ToolCalls => "tool_calls",
-        FinishReason::ContentFilter => "content_filter",
-        FinishReason::FunctionCall => "function_call",
-    }
-    .to_string()
 }
 
 #[cfg(test)]

@@ -6,7 +6,6 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use crate::backend::{Backend, Failure, Reason};
 use crate::cache::{self, Form, KeyParts};
@@ -16,9 +15,6 @@ use crate::pager;
 use crate::prompt;
 use crate::translate;
 use crate::validate;
-
-/// 重试前等待（§7.7）。
-const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// 拦截入口：捕获 man 结果、翻译描述列，再按 stdout 是否 TTY 交付。
 ///
@@ -106,14 +102,18 @@ struct Cut<'a> {
     ending: &'a [u8],
 }
 
-/// 只对「有分隔符 + 描述是合法非空 UTF-8」的行返回切分；其余整体原样保留。
+/// 只对「有分隔符 + 整行是合法 UTF-8 + 描述非空」的行返回切分；其余整体原样保留。
+///
+/// 名字列出现非法字节时，该行不送模型也不替换（§5.4 第 5 条）。
 fn cut(line: &[u8]) -> Option<Cut<'_>> {
     let (body, ending) = match line.strip_suffix(b"\n") {
         Some(body) => (body, &line[line.len() - 1..]),
         None => (line, &line[line.len()..]),
     };
+    let text = std::str::from_utf8(body).ok()?;
     let at = body.windows(3).position(|window| window == b" - ")?;
-    let desc = std::str::from_utf8(&body[at + 3..]).ok()?;
+    // 分隔符是 ASCII，切点必在字符边界上。
+    let desc = &text[at + 3..];
     if desc.is_empty() {
         return None;
     }
@@ -181,10 +181,11 @@ async fn request(
     loop {
         match backend.post(&system, user).await {
             Ok(completion) => {
-                let truncated = completion.finish_reason.as_deref() == Some("length");
                 let text = validate::postprocess(&completion.content);
-                if !truncated && let Some(values) = parse_batch(&text, expected) {
-                    return Ok((text, values));
+                if !completion.truncated {
+                    if let Some(values) = parse_batch(&text, expected) {
+                        return Ok((text, values));
+                    }
                 }
                 if retried {
                     return Err(Failure::new(Reason::BackendError, true));
@@ -197,7 +198,7 @@ async fn request(
             }
         }
         retried = true;
-        tokio::time::sleep(RETRY_DELAY).await;
+        tokio::time::sleep(translate::RETRY_DELAY).await;
     }
 }
 
@@ -267,6 +268,7 @@ mod tests {
     fn 无分隔与非_utf8_不切分() {
         assert!(cut(b"no separator here\n").is_none());
         assert!(cut(b"bad - \xff\n").is_none());
+        assert!(cut(b"bad\xffname - valid description\n").is_none());
         assert!(cut(b"empty - \n").is_none());
         assert_eq!(cut(b"tail - x").unwrap().ending, b"");
     }

@@ -34,13 +34,7 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
     let stdout_tty = io::stdout().is_terminal();
     if scan.kf && own.translate != Some(false) && (stdout_tty || own.translate == Some(true)) {
         let loaded = config::load(config::config_path().as_deref());
-        let cli_lang = lang.and_then(|raw| Language::parse_cli(raw).ok());
-        let config_lang = loaded
-            .config
-            .lang
-            .as_deref()
-            .and_then(Language::from_config);
-        let language = Language::resolve(cli_lang, config_lang);
+        let language = resolve_language(&loaded, lang);
         // §11.3：en 不拦截、不设 MANPAGER、不写 stderr。
         if language.is_english() {
             return exec_man(&own.rest);
@@ -55,13 +49,7 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
     // §5.3：非 TTY 的 --translate 捕获 man 输出后翻译。
     if own.translate == Some(true) && !io::stdout().is_terminal() {
         let loaded = config::load(config::config_path().as_deref());
-        let cli_lang = lang.and_then(|raw| Language::parse_cli(raw).ok());
-        let config_lang = loaded
-            .config
-            .lang
-            .as_deref()
-            .and_then(Language::from_config);
-        let language = Language::resolve(cli_lang, config_lang);
+        let language = resolve_language(&loaded, lang);
         if !language.is_english() {
             for warning in &loaded.warnings {
                 eprintln!("{warning}");
@@ -72,6 +60,18 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
     save_manpager();
     set_env("MANPAGER", manpager_value(lang, own.translate));
     exec_man(&own.rest)
+}
+
+/// `--lang` 优先于配置里的 `lang`；命令行值已在 `main` 校验过。
+fn resolve_language(loaded: &config::LoadedConfig, lang: Option<&str>) -> Language {
+    Language::resolve(
+        lang.and_then(|raw| Language::parse_cli(raw).ok()),
+        loaded
+            .config
+            .lang
+            .as_deref()
+            .and_then(Language::from_config),
+    )
 }
 
 /// 非 TTY 的 `--translate`：设子进程 `MANPAGER=cat` 捕获 man 输出再翻译（§5.3）。

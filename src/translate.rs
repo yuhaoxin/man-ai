@@ -105,7 +105,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let interrupt = out.interrupt_flag().unwrap_or_default();
     let mut adopted = 0;
     let mut failures: Vec<Reason> = Vec::new();
-    let mut diagnostics: Vec<String> = Vec::new();
+    let mut diagnosed = false;
     let mut deterministic = false;
 
     let backend = ctx.backend;
@@ -169,15 +169,16 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                 }
             }
         })
-        .buffered(ctx.concurrency.max(1));
+        .buffered(ctx.concurrency);
     futures::pin_mut!(results);
 
     while let Some(result) = results.next().await {
         if let Some(failure) = &result.failure {
+            /* 每进程最多输出一条失败诊断，取第一个失败（§10.5）。 */
             if let Some(line) = &failure.diagnostic {
-                if !diagnostics.iter().any(|seen| seen == line) {
-                    diagnostics.push(line.clone());
+                if !diagnosed {
                     out.diagnostic(line);
+                    diagnosed = true;
                 }
             }
             if failure.reason == Reason::Interrupted {
@@ -317,7 +318,7 @@ async fn post(
 
 /// §7.4 加工 + §7.5 校验。
 fn evaluate(input: &str, completion: &Completion) -> Verdict {
-    if completion.finish_reason.as_deref() == Some("length") {
+    if completion.truncated {
         return Verdict::Rejected;
     }
     let text = validate::postprocess(&completion.content);
@@ -367,7 +368,7 @@ mod tests {
     fn completion(content: &str, finish: Option<&str>) -> Completion {
         Completion {
             content: content.to_string(),
-            finish_reason: finish.map(str::to_string),
+            truncated: finish == Some("length"),
         }
     }
 

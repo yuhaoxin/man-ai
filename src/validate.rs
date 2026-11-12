@@ -91,8 +91,7 @@ pub fn structural(text: &str) -> Result<(), Invalid> {
         return Err(Invalid::LiteralEscape);
     }
     let bytes = text.as_bytes();
-    // 常见样式位：1 2 3 4 7 8 9，位序与数组下标一致。
-    let mut open: u8 = 0;
+    let mut open = Open::default();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
@@ -122,7 +121,7 @@ pub fn structural(text: &str) -> Result<(), Invalid> {
             _ => i += 1,
         }
     }
-    if open != 0 {
+    if open.bits != 0 || open.unknown {
         return Err(Invalid::Sgr);
     }
     Ok(())
@@ -132,41 +131,67 @@ fn is_printable(byte: u8) -> bool {
     byte >= 0x20 && byte != 0x7f
 }
 
+/// 跟踪的样式位；位序与 `style_bit` 的下标一致。
+const BOLD: u8 = 1 << 0;
+const DIM: u8 = 1 << 1;
+const ITALIC: u8 = 1 << 2;
+const UNDERLINE: u8 = 1 << 3;
+const REVERSE: u8 = 1 << 4;
+const HIDDEN: u8 = 1 << 5;
+const STRIKE: u8 = 1 << 6;
+
 fn style_bit(param: u16) -> Option<u8> {
-    let index = match param {
-        1 => 0,
-        2 => 1,
-        3 => 2,
-        4 => 3,
-        7 => 4,
-        8 => 5,
-        9 => 6,
+    let bit = match param {
+        1 => BOLD,
+        2 => DIM,
+        3 => ITALIC,
+        4 => UNDERLINE,
+        7 => REVERSE,
+        8 => HIDDEN,
+        9 => STRIKE,
         _ => return None,
     };
-    Some(1 << index)
+    Some(bit)
 }
 
-fn apply_sgr(params: &[u8], open: &mut u8) {
-    let text = std::str::from_utf8(params).unwrap_or("");
+/// 未关闭的样式：已知位按位记录，未知参数只记「有未知开启」。
+///
+/// §7.5：未知参数按开启处理，只有 `0`/空参数能清掉它们。
+#[derive(Default)]
+struct Open {
+    bits: u8,
+    unknown: bool,
+}
+
+fn apply_sgr(params: &[u8], open: &mut Open) {
+    let text = std::str::from_utf8(params).expect("SGR params are ASCII");
     if text.is_empty() {
-        *open = 0;
+        *open = Open::default();
         return;
     }
     for part in text.split(';') {
-        let value = part.parse::<u16>().unwrap_or(0);
+        // 省略的参数（空段）在 SGR 里等同 0，即清空全部。
+        if part.is_empty() {
+            *open = Open::default();
+            continue;
+        }
+        // 超出 u16 的参数没有已知含义，按未知开启处理。
+        let Ok(value) = part.parse::<u16>() else {
+            open.unknown = true;
+            continue;
+        };
         match value {
-            0 => *open = 0,
-            22 => *open &= !(style_bit(1).unwrap() | style_bit(2).unwrap()),
-            23 => *open &= !style_bit(3).unwrap(),
-            24 => *open &= !style_bit(4).unwrap(),
-            27 => *open &= !style_bit(7).unwrap(),
-            28 => *open &= !style_bit(8).unwrap(),
-            29 => *open &= !style_bit(9).unwrap(),
-            _ => {
-                if let Some(bit) = style_bit(value) {
-                    *open |= bit;
-                }
-            }
+            0 => *open = Open::default(),
+            22 => open.bits &= !(BOLD | DIM),
+            23 => open.bits &= !ITALIC,
+            24 => open.bits &= !UNDERLINE,
+            27 => open.bits &= !REVERSE,
+            28 => open.bits &= !HIDDEN,
+            29 => open.bits &= !STRIKE,
+            _ => match style_bit(value) {
+                Some(bit) => open.bits |= bit,
+                None => open.unknown = true,
+            },
         }
     }
 }
@@ -221,6 +246,9 @@ mod tests {
             "\x1b[7mrev\x1b[27m",
             "\x1b[9mstrike\x1b[29m",
             "\x1b[1m\x1b[m",
+            "\x1b[31mred\x1b[0m",
+            "\x1b[38;5;196mred\x1b[0m",
+            "\x1b[1;4mstyled\x1b[;m",
             "X\x08X",
             "X\x08_",
             "指标\x1b[1m加粗\x1b[0m",
@@ -244,11 +272,17 @@ mod tests {
             "\x1b[1",
             "\x1b[1mnever closed",
             "\x1b[4munder not closed",
+            // 未知参数按开启处理，块结束时未关闭即非法。
+            "\x1b[31mred",
+            "\x1b[38;5;196mred",
+            "\x1b[1;31mtext\x1b[22m",
+            "\x1b[31mred\x1b[39m",
+            "\x1b[99999mbig",
         ] {
             assert_eq!(structural(text), Err(Invalid::Sgr), "{text:?}");
         }
-        // 22 关闭 1 与 2；31 不是被跟踪的位。
-        assert_eq!(structural("\x1b[1;31mtext\x1b[22m"), Ok(()));
+        // 22 关闭 1 与 2；未知的 31 由 0 关闭。
+        assert_eq!(structural("\x1b[1;31mtext\x1b[0m"), Ok(()));
         assert_eq!(structural("\x1b[31m red \x1b[0m"), Ok(()));
     }
 

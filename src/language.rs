@@ -6,8 +6,9 @@ use std::env;
 
 /// 剥掉 `.` 起的编码部分与 `@` 起的修饰符。
 fn strip_locale(raw: &str) -> &str {
-    let base = raw.split('.').next().unwrap_or(raw);
-    base.split('@').next().unwrap_or(base)
+    raw.split(['.', '@'])
+        .next()
+        .expect("split yields at least one part")
 }
 
 /// §11.2：归一化为 `^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$` 形态，非法返回 `None`。
