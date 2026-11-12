@@ -1,6 +1,6 @@
-//! #20 及后续票共用的集成测试工具：临时 XDG 配置、假 man、pty 运行、内嵌假模型服务。
+//! 集成测试共用工具：临时 XDG 配置、假 man、pty 运行、内嵌假模型服务。
 //!
-//! 每个测试文件都 `mod common;`，因此这里的工具按「可能未使用」处理。
+//! 供 `mod common;` 的测试文件使用，因此这里的工具按「可能未使用」处理。
 
 #![allow(dead_code)]
 
@@ -77,8 +77,8 @@ pub fn write_script(path: &Path, body: &str) {
 
 /// 指向假模型服务的配置文件内容。
 ///
-/// 默认 `concurrency = 1`：#20 的脚本化应答按请求到达顺序对应块，只有串行时
-/// 这个对应关系才确定；#21 的并发测试用 [`model_config_with`]。
+/// 默认 `concurrency = 1`：脚本化应答按请求到达顺序对应块，只有串行时
+/// 这个对应关系才确定；并发测试用 [`model_config_with`]。
 pub fn model_config(model: &FakeModel, extra: &str) -> String {
     model_config_with(model, 1, extra)
 }
@@ -89,6 +89,36 @@ pub fn model_config_with(model: &FakeModel, concurrency: usize, extra: &str) -> 
         "endpoint = \"{}/\"\nmodel = \"test-model\"\napi_key = \"sk-test\"\nconcurrency = {concurrency}\n{extra}",
         model.endpoint()
     )
+}
+
+/// 独立的 `XDG_CACHE_HOME`；缓存断言只看本次运行的目录。
+pub fn cache_env(dir: &TempDir) -> Vec<(&'static str, String)> {
+    let path = dir.file("cache");
+    vec![("XDG_CACHE_HOME", path.to_str().unwrap().to_string())]
+}
+
+pub fn env_refs<'a>(env: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
+    env.iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect()
+}
+
+/// `v1` 下的缓存条目文件数（不含 tmp）。
+pub fn entries(dir: &TempDir) -> usize {
+    let v1 = dir.file("cache").join("man-ai").join("v1");
+    fs::read_dir(&v1)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|shard| shard.file_name() != "tmp")
+        .map(|shard| {
+            fs::read_dir(shard.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .count()
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------- 普通运行
@@ -210,7 +240,7 @@ fn strip_carriage_returns(bytes: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// 在 pty 下跑一条 shell 命令，输出去掉 pty 的 `\r`；#24 差分用。
+/// 在 pty 下跑一条 shell 命令，输出去掉 pty 的 `\r`；差分测试用。
 ///
 /// 命令自己负责重定向 stderr（通常重定向到 `dir.file(...)`），因为这里只回传 pty 输出。
 pub fn run_pty_command(dir: &TempDir, script: &str, extra_env: &[(&str, &str)]) -> (Vec<u8>, i32) {
@@ -384,6 +414,152 @@ pub fn fake_kman(dir: &TempDir, output: &[u8], code: i32) -> PathBuf {
         ),
     );
     record
+}
+
+/// 记录 man 实际收到的 argv 与关键环境变量，然后按给定退出码退出。
+pub fn recording_man(dir: &TempDir, exit_code: i32) -> PathBuf {
+    let record = dir.file("man-record.txt");
+    write_script(
+        &dir.file("man"),
+        &format!(
+            "#!/bin/sh\n{{\n\
+             echo \"args=$*\"\n\
+             echo \"MANPAGER=${{MANPAGER-<unset>}}\"\n\
+             echo \"MAN_AI_PAGER=${{MAN_AI_PAGER-<unset>}}\"\n\
+             echo \"MAN_KEEP_FORMATTING=${{MAN_KEEP_FORMATTING-<unset>}}\"\n\
+             }} > '{record}'\nexit {exit_code}\n",
+            record = record.display()
+        ),
+    );
+    record
+}
+
+/// 读 [`recording_man`] 记录文件里 `key=value` 的右值。
+pub fn record_value(record: &Path, key: &str) -> String {
+    let text = fs::read_to_string(record).unwrap_or_default();
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap_or("<missing>")
+        .to_string()
+}
+
+pub fn recorded_args(record: &Path) -> String {
+    record_value(record, "args")
+}
+
+// ---------------------------------------------------------------- 真 man 差分
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// 仓库内自写的 roff fixture 页，写进临时 MANPATH。
+fn fixture_manpath(root: &Path) -> PathBuf {
+    let man1 = root.join("man/man1");
+    fs::create_dir_all(&man1).unwrap();
+    fs::write(
+        man1.join("man-ai-fixture.1"),
+        ".TH MAN-AI-FIXTURE 1 \"2026-01-01\" \"man-ai 0.1.0\" \"General Commands Manual\"\n\
+         .SH NAME\n\
+         man-ai-fixture \\- fixture page for differential tests\n\
+         .SH DESCRIPTION\n\
+         .PP\n\
+         This page exists only to pin byte compatibility with the platform man.\n\
+         .PP\n\
+         A second paragraph keeps the page longer than one block.\n\
+         .SH OPTIONS\n\
+         .TP\n\
+         .B \\-\\-no-translate\n\
+         Pass the rendered page through unchanged.\n",
+    )
+    .unwrap();
+    root.join("man")
+}
+
+/// 真 man + 固定 MANPATH 的差分环境；基线每次现场生成。
+pub struct RealMan {
+    pub dir: TempDir,
+    man: PathBuf,
+    pub base_path: String,
+    pub manpath: PathBuf,
+}
+
+impl RealMan {
+    /// 本机没有 `man` 时返回 `None`，调用方跳过。
+    pub fn new(tag: &str) -> Option<Self> {
+        let man = find_in_path("man")?;
+        let dir = TempDir::new(tag);
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        // MANPAGER 里的 man-ai 从 PATH 解析（§4.2 只写二进制名）。
+        write_script(
+            &bin_dir.join("man-ai"),
+            &format!("#!/bin/sh\nexec '{BIN}' \"$@\"\n"),
+        );
+        let manpath = fixture_manpath(dir.path());
+        Some(RealMan {
+            dir,
+            base_path: format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+            man,
+            manpath,
+        })
+    }
+
+    /// 在 pty 下跑一条命令，stderr 落到 `dir` 里的独立文件。
+    pub fn run(
+        &self,
+        tag: &str,
+        command: &str,
+        extra_env: &[(&str, &str)],
+        lc_all: &str,
+    ) -> (Vec<u8>, String, i32) {
+        let stderr_file = self.dir.file(&format!("{tag}.stderr"));
+        let script = format!("{command} 2>{}\n", shell_quote(&stderr_file));
+        let mut env = vec![
+            ("PATH", self.base_path.as_str()),
+            ("HOME", self.dir.path().to_str().unwrap()),
+            ("MANPATH", self.manpath.to_str().unwrap()),
+            ("MANWIDTH", "80"),
+            ("LC_ALL", lc_all),
+            ("TERM", "dumb"),
+            // groff 据此生成固定的 PostScript 头部；mandoc 忽略。
+            ("SOURCE_DATE_EPOCH", "0"),
+        ];
+        env.extend_from_slice(extra_env);
+        let (output, code) = run_pty_command(&self.dir, &script, &env);
+        let stderr = fs::read_to_string(&stderr_file).unwrap_or_default();
+        (output, stderr, code)
+    }
+
+    pub fn man_command(&self, args: &str) -> String {
+        format!("{} {args}", shell_quote(&self.man))
+    }
+
+    /// fixture 页所在的临时 MANPATH 根。
+    pub fn manpath(&self) -> &Path {
+        &self.manpath
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
+/// 逐字节比较 stdout；失败信息才做有损解码。
+pub fn assert_bytes_eq(ours: &[u8], baseline: &[u8], label: &str) {
+    assert!(
+        ours == baseline,
+        "{label}：stdout 应与平台 man 逐字节一致\nours={:?}\nman={:?}",
+        String::from_utf8_lossy(ours),
+        String::from_utf8_lossy(baseline)
+    );
 }
 
 // ---------------------------------------------------------------- 假模型服务

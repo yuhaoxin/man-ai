@@ -1,74 +1,22 @@
-//! #18 透传骨架的集成测试：CLI、薄壳模式、分页器模式与真 man 差分。
+//! CLI、薄壳模式、分页器模式与真 man 差分的集成测试。
 //!
 //! 薄壳模式的判定依赖 stdin 是 TTY，分页器链依赖 stdout 是 TTY，两者都只能
 //! 在 pty 下观察；pty 里的 `sh -c` 让需要方向的一端接管道。
 
+mod common;
+
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-
-const BIN: &str = env!("CARGO_BIN_EXE_man-ai");
+use common::{
+    BIN, RealMan, TempDir, assert_bytes_eq, record_value, recorded_args, recording_man, run_pipe,
+    run_pty_command, write_script,
+};
 
 // ---------------------------------------------------------------- 小工具
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "man-ai-t18-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        TempDir(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn write_script(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-fn envs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-/// 非 TTY 运行：stdin/stdout/stderr 都是管道。
-fn run(args: &[&str], extra_env: &[(&str, &str)], stdin: &[u8]) -> Output {
-    let mut child = Command::new(BIN)
-        .args(args)
-        .env_remove("MANPAGER")
-        .env_remove("MAN_AI_PAGER")
-        .env_remove("PAGER")
-        .envs(extra_env.iter().copied())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
-    child.wait_with_output().unwrap()
+/// pty 会把 `\n` 写成 `\r\n`，比较文本前统一掉。
+fn pty_text(output: &[u8]) -> String {
+    String::from_utf8_lossy(output).replace("\r\n", "\n")
 }
 
 struct PtyOut {
@@ -76,63 +24,12 @@ struct PtyOut {
     code: i32,
 }
 
-/// 在 pty 下运行脚本：stdin 与 stdout 都是终端。
-fn run_pty(script: &str, extra_env: &[(String, String)]) -> PtyOut {
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 30,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let mut command = CommandBuilder::new("/bin/sh");
-    command.args(["-c", script]);
-    command.env_clear();
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = pair.slave.spawn_command(command).unwrap();
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output).unwrap();
-    let status = child.wait().unwrap();
-    PtyOut {
-        output,
-        code: status.exit_code() as i32,
-    }
-}
-
-/// pty 会把 `\n` 写成 `\r\n`，比较文本前统一掉。
-fn pty_text(output: &[u8]) -> String {
-    String::from_utf8_lossy(output).replace("\r\n", "\n")
-}
-
 // ---------------------------------------------------------------- 假 man / 假分页器
 
-/// 记录 man 实际收到的 argv 与三个关键环境变量，然后按给定退出码退出。
-fn fake_man(dir: &Path, exit_code: i32) -> PathBuf {
-    let record = dir.join("man-record.txt");
-    write_script(
-        &dir.join("man"),
-        &format!(
-            "#!/bin/sh\n{{\n\
-             echo \"args=$*\"\n\
-             echo \"MANPAGER=${{MANPAGER-<unset>}}\"\n\
-             echo \"MAN_AI_PAGER=${{MAN_AI_PAGER-<unset>}}\"\n\
-             echo \"MAN_KEEP_FORMATTING=${{MAN_KEEP_FORMATTING-<unset>}}\"\n\
-             }} > '{record}'\nexit {exit_code}\n",
-            record = record.display()
-        ),
-    );
-    record
-}
-
 /// 假内层分页器：记录 argv，原样输出 stdin，按给定退出码退出。
-fn fake_pager(dir: &Path, name: &str, exit_code: i32) -> PathBuf {
-    let argv_file = dir.join(format!("{name}-argv.txt"));
-    let script = dir.join(name);
+fn fake_pager(dir: &TempDir, name: &str, exit_code: i32) -> std::path::PathBuf {
+    let argv_file = dir.file(&format!("{name}-argv.txt"));
+    let script = dir.file(name);
     write_script(
         &script,
         &format!(
@@ -143,41 +40,29 @@ fn fake_pager(dir: &Path, name: &str, exit_code: i32) -> PathBuf {
     script
 }
 
-fn record_value(record: &Path, key: &str) -> String {
-    let text = fs::read_to_string(record).unwrap_or_default();
-    text.lines()
-        .find_map(|line| line.strip_prefix(&format!("{key}=")))
-        .unwrap_or("<missing>")
-        .to_string()
-}
-
-fn recorded_args(record: &Path) -> String {
-    record_value(record, "args")
-}
-
 struct ShellRun {
     pty: Vec<u8>,
     code: i32,
     stderr: String,
-    record: PathBuf,
+    record: std::path::PathBuf,
 }
 
-/// 在 pty 下以薄壳模式运行 `man-ai <args>`，PATH 里放假 man。
+/// 在 pty 下以薄壳模式运行 `man-ai <args>`；`args` 是 shell 片段，PATH 里放假 man。
 fn run_shell(dir: &TempDir, args: &str, extra_env: &[(&str, &str)], man_exit: i32) -> ShellRun {
-    let record = fake_man(dir.path(), man_exit);
-    let stderr_file = dir.path().join("man-ai-stderr.txt");
+    let record = recording_man(dir, man_exit);
+    let stderr_file = dir.file("man-ai-stderr.txt");
     let path = format!("{}:/usr/bin:/bin", dir.path().display());
     let script = format!("'{BIN}' {args} 2>'{err}'\n", err = stderr_file.display());
-    let mut all_env = envs(&[
-        ("PATH", &path),
-        ("HOME", &dir.path().display().to_string()),
+    let mut env = vec![
+        ("PATH", path.as_str()),
+        ("HOME", dir.path().to_str().unwrap()),
         ("TERM", "dumb"),
-    ]);
-    all_env.extend(envs(extra_env));
-    let pty = run_pty(&script, &all_env);
+    ];
+    env.extend_from_slice(extra_env);
+    let (output, code) = run_pty_command(dir, &script, &env);
     ShellRun {
-        pty: pty.output,
-        code: pty.code,
+        pty: output,
+        code,
         stderr: fs::read_to_string(&stderr_file).unwrap_or_default(),
         record,
     }
@@ -187,8 +72,9 @@ fn run_shell(dir: &TempDir, args: &str, extra_env: &[(&str, &str)], man_exit: i3
 
 #[test]
 fn help_打印用法与五个自有参数() {
-    let out = run(&["--help"], &[], b"");
-    assert!(out.status.success());
+    let dir = TempDir::new("t18-help");
+    let out = run_pipe(&dir, &["--help"], b"", &[]);
+    assert_eq!(out.code, 0);
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("Usage: man-ai"), "{text}");
     for own in [
@@ -213,8 +99,9 @@ fn help_打印用法与五个自有参数() {
 
 #[test]
 fn version_打印名字与语义版本() {
-    let out = run(&["--version"], &[], b"");
-    assert_eq!(out.status.code(), Some(0));
+    let dir = TempDir::new("t18-version");
+    let out = run_pipe(&dir, &["--version"], b"", &[]);
+    assert_eq!(out.code, 0);
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         format!("man-ai {}\n", env!("CARGO_PKG_VERSION"))
@@ -224,19 +111,21 @@ fn version_打印名字与语义版本() {
 
 #[test]
 fn help_与_version_优先于语言校验与入口判定() {
+    let dir = TempDir::new("t18-help-priority");
     for argv in [
         vec!["--lang", "非法 值", "--help"],
         vec!["-P", "less", "--version"],
         vec!["--lang", "--help"],
     ] {
-        let out = run(&argv, &[], b"");
-        assert_eq!(out.status.code(), Some(0), "{argv:?} 应成功");
+        let out = run_pipe(&dir, &argv, b"", &[]);
+        assert_eq!(out.code, 0, "{argv:?} 应成功");
         assert!(!out.stdout.is_empty());
     }
 }
 
 #[test]
 fn lang_缺值空值形状非法退出二() {
+    let dir = TempDir::new("t18-lang-invalid");
     for argv in [
         vec!["--lang"],
         vec!["--lang="],
@@ -247,8 +136,8 @@ fn lang_缺值空值形状非法退出二() {
         vec!["--lang", "-zh"],
         vec!["ls", "--lang"],
     ] {
-        let out = run(&argv, &[], b"");
-        assert_eq!(out.status.code(), Some(2), "{argv:?} 应退出 2");
+        let out = run_pipe(&dir, &argv, b"", &[]);
+        assert_eq!(out.code, 2, "{argv:?} 应退出 2");
         assert!(out.stdout.is_empty(), "{argv:?} 不应写 stdout");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -261,12 +150,14 @@ fn lang_缺值空值形状非法退出二() {
 #[test]
 fn lang_合法时不报错并进入分页器模式() {
     // stdout 不是 TTY → 分页器模式，原文直通 stdout。
-    let out = run(
+    let dir = TempDir::new("t18-lang-ok");
+    let out = run_pipe(
+        &dir,
         &["--lang", "zh_CN.UTF-8", "--no-translate"],
-        &[],
         b"page bytes\n",
+        &[],
     );
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.code, 0);
     assert_eq!(out.stdout, b"page bytes\n");
     assert!(out.stderr.is_empty());
 }
@@ -275,17 +166,19 @@ fn lang_合法时不报错并进入分页器模式() {
 
 #[test]
 fn 分页器模式读完_stdin_并直写_stdout() {
+    let dir = TempDir::new("t18-pager");
     let input: &[u8] = b"LS(1)\n\n     l\x1bls\x08s - list\n\n\nend without newline";
-    let out = run(&[], &[], input);
-    assert_eq!(out.status.code(), Some(0));
+    let out = run_pipe(&dir, &[], input, &[]);
+    assert_eq!(out.code, 0);
     assert_eq!(out.stdout, input);
     assert!(out.stderr.is_empty());
 }
 
 #[test]
 fn 分页器模式忽略_stdin_为空的情形() {
-    let out = run(&[], &[], b"");
-    assert_eq!(out.status.code(), Some(0));
+    let dir = TempDir::new("t18-pager-empty");
+    let out = run_pipe(&dir, &[], b"", &[]);
+    assert_eq!(out.code, 0);
     assert!(out.stdout.is_empty());
 }
 
@@ -435,44 +328,39 @@ fn 透传入口摘掉自有参数() {
 
 #[test]
 fn 找不到_man_时退出_127() {
-    let pty = run_pty(
+    let dir = TempDir::new("t18-no-man");
+    let (_, code) = run_pty_command(
+        &dir,
         &format!("'{BIN}' ls"),
-        &envs(&[("PATH", "/nonexistent"), ("TERM", "dumb")]),
+        &[("PATH", "/nonexistent"), ("TERM", "dumb")],
     );
-    assert_eq!(pty.code, 127);
+    assert_eq!(code, 127);
 }
 
 // ---------------------------------------------------------------- 内层分页器链
 
 /// 在 pty 下跑分页器模式：stdin 是管道，stdout 是终端。
 fn run_pager_mode(dir: &TempDir, args: &str, extra_env: &[(&str, &str)], input: &str) -> PtyOut {
-    let stderr_file = dir.path().join("pager-stderr.txt");
+    let stderr_file = dir.file("pager-stderr.txt");
     let script = format!(
         "printf '%s' '{input}' | '{BIN}' {args} 2>'{err}'\n",
         err = stderr_file.display()
     );
-    let mut all_env = envs(&[
-        ("HOME", &dir.path().display().to_string()),
-        ("TERM", "dumb"),
-    ]);
-    all_env.extend(envs(extra_env));
-    let pty = run_pty(&script, &all_env);
+    let mut env = vec![("HOME", dir.path().to_str().unwrap()), ("TERM", "dumb")];
+    env.extend_from_slice(extra_env);
+    let (mut output, code) = run_pty_command(dir, &script, &env);
     let stderr = fs::read_to_string(&stderr_file).unwrap_or_default();
-    let mut output = pty.output;
     // 让调用方通过环境读到 stderr：warning 走文件，正文走 pty。
     if !stderr.is_empty() {
         output.extend_from_slice(format!("\n[stderr]{stderr}").as_bytes());
     }
-    PtyOut {
-        output,
-        code: pty.code,
-    }
+    PtyOut { output, code }
 }
 
 #[test]
 fn 分页器链追加剩余_argv_并原样直通() {
     let dir = TempDir::new("pager-args");
-    let pager = fake_pager(dir.path(), "pager", 0);
+    let pager = fake_pager(&dir, "pager", 0);
     let extra = [("MAN_AI_PAGER", pager.to_str().unwrap())];
     let pty = run_pager_mode(
         &dir,
@@ -491,7 +379,7 @@ fn 分页器链追加剩余_argv_并原样直通() {
 #[test]
 fn 分页器链按_man_ai_pager_再_pager() {
     let dir = TempDir::new("pager-order");
-    let pager = fake_pager(dir.path(), "pager", 0);
+    let pager = fake_pager(&dir, "pager", 0);
     let pty = run_pager_mode(&dir, "", &[("PAGER", pager.to_str().unwrap())], "x\n");
     assert_eq!(pty.code, 0);
     assert_eq!(pty_text(&pty.output), "x\n");
@@ -501,8 +389,8 @@ fn 分页器链按_man_ai_pager_再_pager() {
     );
 
     // MAN_AI_PAGER 优先于 PAGER。
-    let first = fake_pager(dir.path(), "first", 0);
-    let second = fake_pager(dir.path(), "second", 0);
+    let first = fake_pager(&dir, "first", 0);
+    let second = fake_pager(&dir, "second", 0);
     let pty = run_pager_mode(
         &dir,
         "",
@@ -520,7 +408,7 @@ fn 分页器链按_man_ai_pager_再_pager() {
 #[test]
 fn 拆词失败警告并跳到下一候选() {
     let dir = TempDir::new("pager-badquote");
-    let pager = fake_pager(dir.path(), "pager", 0);
+    let pager = fake_pager(&dir, "pager", 0);
     let pty = run_pager_mode(
         &dir,
         "",
@@ -542,7 +430,7 @@ fn 递归指向自身时跳到下一候选() {
     let dir = TempDir::new("pager-loop");
     let link = dir.path().join("man-ai");
     std::os::unix::fs::symlink(BIN, &link).unwrap();
-    let pager = fake_pager(dir.path(), "pager", 0);
+    let pager = fake_pager(&dir, "pager", 0);
     let pty = run_pager_mode(
         &dir,
         "",
@@ -568,7 +456,7 @@ fn 整条链不可用时直写_stdout_并退出零() {
 #[test]
 fn 分页器退出码透传() {
     let dir = TempDir::new("pager-exit");
-    let pager = fake_pager(dir.path(), "pager", 3);
+    let pager = fake_pager(&dir, "pager", 3);
     let pty = run_pager_mode(
         &dir,
         "",
@@ -593,160 +481,66 @@ fn 分页器被信号杀死时为_128_加信号() {
 
 // ---------------------------------------------------------------- 与平台 man 的字节差分
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-fn fixture_manpath(root: &Path) -> PathBuf {
-    let man1 = root.join("man/man1");
-    fs::create_dir_all(&man1).unwrap();
-    fs::write(
-        man1.join("man-ai-fixture.1"),
-        ".TH MAN-AI-FIXTURE 1 \"2026-01-01\" \"man-ai 0.1.0\" \"General Commands Manual\"\n\
-         .SH NAME\n\
-         man-ai-fixture \\- fixture page for differential tests\n\
-         .SH DESCRIPTION\n\
-         .PP\n\
-         This page exists only to pin byte compatibility with the platform man.\n\
-         .PP\n\
-         A second paragraph keeps the page longer than one block.\n",
-    )
-    .unwrap();
-    root.join("man")
-}
-
-/// 真 man + 固定 `MANPATH` 的差分环境；基线每次由本机 man 现场生成。
-struct RealMan {
-    dir: TempDir,
-    man: PathBuf,
-    base_path: String,
-    manpath: PathBuf,
-}
-
-impl RealMan {
-    fn new(tag: &str) -> Option<Self> {
-        let man = find_in_path("man")?;
-        let dir = TempDir::new(tag);
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir_all(&bin_dir).unwrap();
-        // man 通过 MANPAGER 调用的 man-ai 从 PATH 解析（§4.2 只写二进制名）。
-        write_script(
-            &bin_dir.join("man-ai"),
-            &format!("#!/bin/sh\nexec '{BIN}' \"$@\"\n"),
-        );
-        let manpath = fixture_manpath(dir.path());
-        let base_path = format!(
-            "{}:{}",
-            bin_dir.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        Some(RealMan {
-            dir,
-            man,
-            base_path,
-            manpath,
-        })
-    }
-
-    /// 在 pty 下跑一条命令，stderr 落到单独文件；返回输出与 stderr。
-    fn run(
-        &self,
-        stderr_name: &str,
-        command: &str,
-        extra_env: &[(&str, &str)],
-    ) -> (PtyOut, String) {
-        let stderr_file = self.dir.path().join(stderr_name);
-        let script = format!("{command} 2>'{err}'\n", err = stderr_file.display());
-        let mut all_env = envs(&[
-            ("PATH", &self.base_path),
-            ("HOME", &self.dir.path().display().to_string()),
-            ("MANPATH", &self.manpath.display().to_string()),
-            ("MANWIDTH", "80"),
-            ("LC_ALL", "C.UTF-8"),
-            ("TERM", "dumb"),
-            // groff 据此生成固定的 PostScript 头部；mandoc 忽略。
-            ("SOURCE_DATE_EPOCH", "0"),
-        ]);
-        all_env.extend(envs(extra_env));
-        let pty = run_pty(&script, &all_env);
-        (
-            PtyOut {
-                output: pty.output,
-                code: pty.code,
-            },
-            fs::read_to_string(&stderr_file).unwrap_or_default(),
-        )
-    }
-
-    fn man_command(&self, args: &str) -> String {
-        format!("'{man}' {args}", man = self.man.display())
-    }
-}
-
 #[test]
 fn 不翻译路径与平台_man_字节一致() {
-    let Some(real) = RealMan::new("diff-page") else {
+    let Some(real) = RealMan::new("t18-diff-page") else {
         eprintln!("跳过：本机没有 man");
         return;
     };
     let page = "1 man-ai-fixture";
 
-    let (baseline, baseline_stderr) = real.run(
-        "err-baseline.txt",
+    let (baseline, baseline_stderr, baseline_code) = real.run(
+        "baseline",
         &real.man_command(page),
         &[("MANPAGER", "cat")],
+        "C.UTF-8",
     );
-    let (ours, ours_stderr) = real.run(
-        "err-ours.txt",
+    let (ours, ours_stderr, ours_code) = real.run(
+        "ours",
         &real.man_command(page),
         &[
             ("MANPAGER", "man-ai --no-translate"),
             ("MAN_AI_PAGER", "cat"),
         ],
+        "C.UTF-8",
     );
 
-    assert_eq!(baseline.code, 0, "基线 man 失败：{baseline_stderr}");
+    assert_eq!(baseline_code, 0, "基线 man 失败：{baseline_stderr}");
     assert_eq!(baseline_stderr, "", "基线 man 写了 stderr");
-    assert!(
-        !baseline.output.is_empty(),
-        "基线没有输出，fixture 页可能没找到"
-    );
+    assert!(!baseline.is_empty(), "基线没有输出，fixture 页可能没找到");
     assert_eq!(ours_stderr, "", "man-ai 路径写了 stderr");
-    assert_eq!(ours.code, baseline.code, "退出码应与平台 man 一致");
-    assert_eq!(
-        String::from_utf8_lossy(&ours.output),
-        String::from_utf8_lossy(&baseline.output),
-        "stdout 应与平台 man 逐字节一致"
-    );
+    assert_eq!(ours_code, baseline_code, "退出码应与平台 man 一致");
+    assert_bytes_eq(&ours, &baseline, "不翻译路径");
 }
 
 #[test]
 fn 透传入口_w_与_t_的输出与平台_man_字节一致() {
-    let Some(real) = RealMan::new("diff-entries") else {
+    let Some(real) = RealMan::new("t18-diff-entries") else {
         eprintln!("跳过：本机没有 man");
         return;
     };
 
-    for args in ["-w man-ai-fixture", "-t man-ai-fixture"] {
-        let (baseline, baseline_stderr) =
-            real.run(&format!("err-base{args}.txt"), &real.man_command(args), &[]);
-        let (ours, ours_stderr) = real.run(
-            &format!("err-ours{args}.txt"),
+    for (index, args) in ["-w man-ai-fixture", "-t man-ai-fixture"]
+        .into_iter()
+        .enumerate()
+    {
+        let (baseline, baseline_stderr, baseline_code) = real.run(
+            &format!("base{index}"),
+            &real.man_command(args),
+            &[],
+            "C.UTF-8",
+        );
+        let (ours, ours_stderr, ours_code) = real.run(
+            &format!("ours{index}"),
             &format!("'{BIN}' {args}"),
             &[],
+            "C.UTF-8",
         );
-        assert_eq!(baseline.code, 0, "{args} 基线失败：{baseline_stderr}");
+        assert_eq!(baseline_code, 0, "{args} 基线失败：{baseline_stderr}");
         assert_eq!(baseline_stderr, "", "{args} 基线写了 stderr");
-        assert!(!baseline.output.is_empty(), "{args} 基线没有输出");
+        assert!(!baseline.is_empty(), "{args} 基线没有输出");
         assert_eq!(ours_stderr, "", "{args} man-ai 写了 stderr");
-        assert_eq!(ours.code, baseline.code, "{args} 退出码应与 man 一致");
-        assert_eq!(
-            String::from_utf8_lossy(&ours.output),
-            String::from_utf8_lossy(&baseline.output),
-            "{args} stdout 应与 man 逐字节一致"
-        );
+        assert_eq!(ours_code, baseline_code, "{args} 退出码应与 man 一致");
+        assert_bytes_eq(&ours, &baseline, args);
     }
 }

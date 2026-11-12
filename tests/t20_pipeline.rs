@@ -1,9 +1,9 @@
-//! #20：分页器模式的 TTY 页首行/尾行、部分回退与确定性失败（§8.3、§8.5）。
+//! 分页器模式的 TTY 页首行/尾行、部分回退与确定性失败（§8.3、§8.5）。
 
 mod common;
 
 use common::{
-    FakeModel, Reply, TempDir, completion, error_body, model_config, run_pager_tty, text,
+    FakeModel, Reply, TempDir, completion, error_body, model_config, run_pager_tty, run_pipe, text,
 };
 
 const LANG: &str = "zh-CN";
@@ -71,6 +71,27 @@ fn 确定性失败停止提交后续块() {
         "{}",
         run.stderr
     );
+}
+
+#[test]
+fn 每进程最多一条失败诊断() {
+    let model = FakeModel::start(vec![
+        Reply::Status(429, error_body("rate_limit_exceeded", "requests")),
+        Reply::Status(429, error_body("rate_limit_exceeded", "requests")),
+        Reply::Status(500, error_body("server_error", "api_error")),
+        Reply::Status(500, error_body("server_error", "api_error")),
+    ]);
+    let dir = TempDir::new("diagnostic-once");
+    dir.write_config(&model_config(&model, ""));
+    let run = run_pipe(&dir, &["--translate", "--lang", LANG], b"a\n\nb\n", &[]);
+    assert_eq!(model.count(), 4, "两块各重试一次");
+    let stderr = text(&run.stderr);
+    assert_eq!(
+        stderr.matches("backend returned HTTP").count(),
+        1,
+        "只保留第一个失败的诊断：{stderr}"
+    );
+    assert!(stderr.contains("HTTP 429"), "{stderr}");
 }
 
 #[test]

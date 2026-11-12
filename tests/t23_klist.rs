@@ -1,12 +1,10 @@
-//! #23：`-k`/`-f` 拦截与描述批翻译（§5.4、§7.6、§13.3）。
+//! `-k`/`-f` 拦截与描述批翻译（§5.4、§7.6、§13.3）。
 
 mod common;
 
-use std::fs;
-
 use common::{
-    FakeModel, Reply, TempDir, completion, error_body, fake_kman, model_config, recording_pager,
-    run_shell_capture, run_shell_tty, text, write_script,
+    FakeModel, Reply, TempDir, cache_env, completion, entries, env_refs, error_body, fake_kman,
+    model_config, recording_pager, run_shell_capture, run_shell_tty, text, write_script,
 };
 
 const LANG: &str = "zh-CN";
@@ -18,6 +16,8 @@ fn fixture() -> Vec<u8> {
         b"ls, list    - list directory contents\ncd - change the directory\nweird... - does x - y\n"
             .to_vec();
     bytes.extend_from_slice(b"no separator line\nbad - \xff byte\nempty - \n");
+    // 名字列含非法字节、描述合法：整行不送模型、原样保留（§5.4 第 5 条）。
+    bytes.extend_from_slice(b"bad\xffname - valid description\n");
     bytes
 }
 
@@ -27,40 +27,12 @@ fn translated() -> Vec<u8> {
         .as_bytes()
         .to_vec();
     bytes.extend_from_slice(b"no separator line\nbad - \xff byte\nempty - \n");
+    bytes.extend_from_slice(b"bad\xffname - valid description\n");
     bytes
 }
 
 fn path_with(dir: &TempDir) -> String {
     format!("{}:/usr/bin:/bin", dir.path().display())
-}
-
-fn cache_env(dir: &TempDir) -> Vec<(&'static str, String)> {
-    let path = dir.file("cache");
-    vec![("XDG_CACHE_HOME", path.to_str().unwrap().to_string())]
-}
-
-fn env_refs<'a>(env: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
-    env.iter()
-        .map(|(key, value)| (*key, value.as_str()))
-        .collect()
-}
-
-/// `v1` 下的条目文件数（不含 tmp）。
-fn entries(dir: &TempDir) -> usize {
-    let v1 = dir.file("cache").join("man-ai").join("v1");
-    fs::read_dir(&v1)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|shard| shard.file_name() != "tmp")
-        .map(|shard| {
-            fs::read_dir(shard.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .count()
-        })
-        .sum()
 }
 
 #[test]

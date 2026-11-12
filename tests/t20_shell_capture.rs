@@ -1,4 +1,4 @@
-//! #20：非 TTY 的 `--translate` 捕获 man 输出后翻译（§5.3）。
+//! 非 TTY 的 `--translate` 捕获 man 输出后翻译（§5.3）。
 
 mod common;
 

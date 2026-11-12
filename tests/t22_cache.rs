@@ -1,4 +1,4 @@
-//! #22：块级内容寻址缓存的端到端行为（§9、§13.3）。
+//! 块级内容寻址缓存的端到端行为（§9、§13.3）。
 //!
 //! 缓存根用独立的 `XDG_CACHE_HOME`，断言只关心「请求数是否增加」与条目文件。
 
@@ -8,40 +8,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use common::{
-    FakeModel, Reply, TempDir, completion, error_body, model_config, model_config_with,
-    run_pager_tty, run_pipe, text,
+    FakeModel, Reply, TempDir, cache_env, completion, entries, env_refs, error_body, model_config,
+    model_config_with, run_pager_tty, run_pipe, text,
 };
 
 const LANG: &str = "zh-CN";
-
-fn cache_env(dir: &TempDir) -> Vec<(&'static str, String)> {
-    let path = dir.file("cache");
-    vec![("XDG_CACHE_HOME", path.to_str().unwrap().to_string())]
-}
-
-fn env_refs<'a>(env: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
-    env.iter()
-        .map(|(key, value)| (*key, value.as_str()))
-        .collect()
-}
-
-/// `v1` 下的条目文件数（不含 tmp）。
-fn entries(dir: &TempDir) -> usize {
-    let v1 = dir.file("cache").join("man-ai").join("v1");
-    fs::read_dir(&v1)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|shard| shard.file_name() != "tmp")
-        .map(|shard| {
-            fs::read_dir(shard.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .count()
-        })
-        .sum()
-}
 
 #[test]
 fn 同输入第二次命中零请求且输出一致() {
