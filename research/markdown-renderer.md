@@ -85,3 +85,19 @@
 
 - 代码块**没有**左边框：glow 的 dark 主题只有 2 列缩进（有左边框的是 mdcat）。视觉设计按此对齐。
 - 输出目标是 ratatui 全屏 TUI，不是「写 ANSI 到分页器 stdin」：printer 产出 `Line`/`Span`，颜色用 ratatui `Style`，不拼 escape 字符串。
+
+## 更正：选型结论推翻，不写 printer，改用 tui-markdown
+
+前提错在「增量是硬指标」。全屏 TUI 每帧重画视口，整体重渲染是常态，「不重复输出已渲染内容」这个约束并不成立。
+
+实测（ratatui 0.30 / tui-markdown 0.3.13，TestBackend 下渲染并检查缓冲）：
+
+- `Paragraph::new(text).wrap(Wrap { trim: false })` 在 40 列下把 60 个汉字折成两行，无超宽行、无半个双宽字符——ratatui 自带换行已按 `unicode-width` 处理 CJK，不需要自写折行。
+- `tui-markdown::from_str` 返回 `Text`，`StyleSheet` trait 暴露 `heading(level)`、`heading_marker(level)`（默认 `## ` 前缀）、`code`、`blockquote`、`list_marker`、`table_header`、`table_cell`、`table_border`、`code_block_fence`，够拼出 glamour dark 的视觉，不必自己拼 escape。
+- `Options::table_width(w)` 让表格按宽度折单元格，CJK 双宽列宽正确（实测 40 列下单元格内折行，边框仍是 `┌─┬─┐`）。
+- 依赖（关掉默认的 `highlight-code`）：`pulldown-cmark 0.13` + `itertools` + `ratatui-core 0.1`（default-features 关）+ `tracing`。
+- 性能：431 KB（`man bash` 的渲染文本）整篇 `from_str` 2.8–7.7 ms 一次；典型页面（27–82 KB）0.5–1.5 ms。每帧重算完全够用。
+
+仍然成立的排除：`termimad`（视觉不符、缓冲全文）、`mdcat`（305 依赖、写 ANSI、MSRV 1.95）、`charmed-glamour`（CJK 不折行、整篇 ANSI 字符串）、`ratskin`（继承 termimad 视觉）。表格降级布局也不需要。
+
+判定：自写 printer 只在需要与模型 token 流逐段对齐的增量提交时才有价值，TUI 路线不需要。
