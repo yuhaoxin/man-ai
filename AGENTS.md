@@ -6,7 +6,7 @@ This is a public project. Everything the program prints to stdout or stderr MUST
 
 ### Model output
 
-Only the translated content (`choices[0].message.content`) is used. Model reasoning or thinking fields must never be printed to stdout/stderr, written to diagnostics, or stored in the cache.
+Non-streaming responses use `choices[0].message.content`; streaming responses accumulate `choices[0].delta.content` chunks. Only the first choice is used. Model reasoning or thinking fields must never be printed to stdout/stderr, written to diagnostics, or stored in the cache.
 
 ### Issue tracker
 

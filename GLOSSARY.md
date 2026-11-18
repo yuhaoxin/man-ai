@@ -16,7 +16,7 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 阅读器（reader）
 
-`man-ai` 在 TTY 页面上接管终端显示的进程内 Markdown 阅读器：滚动、搜索、缩放重排由它承担，取代了外置分页器。不要与 `man` 启动的 `man-ai` 混称「分页器」。
+`man-ai` 在 TTY 页面上接管终端显示的进程内 Markdown 阅读器：滚动、搜索、缩放重排与译文直播显示由它承担，页面不经过外置分页器。不要与 `man` 启动的 `man-ai` 混称「分页器」。
 
 ## 块（block）
 
