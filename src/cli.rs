@@ -72,8 +72,8 @@ pub struct EntryScan {
     pub pager_override: bool,
     /// `-w` / `-M` / `-S` / `-t` / `-T` 任一。
     pub passthrough: bool,
-    /// `-k` / `-f`。
-    pub kf: bool,
+    /// 命中的 `-k` / `-f`（首个命中）；用法错误由薄壳报出。
+    pub kf: Option<&'static str>,
 }
 
 const PASSTHROUGH: &[u8] = b"wMStT";
@@ -102,10 +102,12 @@ pub fn scan_entry(rest: &[OsString]) -> EntryScan {
         if cluster.bytes().any(|b| PASSTHROUGH.contains(&b)) {
             scan.passthrough = true;
         }
-        if cluster.bytes().all(|b| KF_CLUSTER.contains(&b))
-            && cluster.bytes().any(|b| b == b'k' || b == b'f')
-        {
-            scan.kf = true;
+        if scan.kf.is_none() && cluster.bytes().all(|b| KF_CLUSTER.contains(&b)) {
+            if cluster.contains('k') {
+                scan.kf = Some("-k");
+            } else if cluster.contains('f') {
+                scan.kf = Some("-f");
+            }
         }
     }
     scan
@@ -240,14 +242,16 @@ mod tests {
 
     #[test]
     fn 入口扫描_kf_聚类() {
-        for argv in [
-            vec!["-k"],
-            vec!["-f"],
-            vec!["-ak"],
-            vec!["-afk"],
-            vec!["-dk"],
+        for (argv, hit) in [
+            (vec!["-k"], "-k"),
+            (vec!["-ak", "list"], "-k"),
+            (vec!["-afk"], "-k"),
+            (vec!["-dk"], "-k"),
+            (vec!["-f"], "-f"),
+            (vec!["-af", "ls"], "-f"),
+            (vec!["-f", "x", "-k"], "-f"),
         ] {
-            assert!(scan_entry(&args(&argv)).kf, "{argv:?} 应命中 -k/-f");
+            assert_eq!(scan_entry(&args(&argv)).kf, Some(hit), "{argv:?}");
         }
         for argv in [
             vec!["-Qk"],
@@ -256,13 +260,14 @@ mod tests {
             vec!["--", "-k"],
             vec!["-a", "--", "-k"],
         ] {
-            assert!(!scan_entry(&args(&argv)).kf, "{argv:?} 不应命中 -k/-f");
+            assert_eq!(scan_entry(&args(&argv)).kf, None, "{argv:?} 不应命中 -k/-f");
         }
+
     }
 
     #[test]
     fn 入口扫描只看双破折号之前() {
         let scan = scan_entry(&args(&["ls", "--", "-P", "-w", "-k"]));
-        assert!(!scan.pager_override && !scan.passthrough && !scan.kf);
+        assert!(!scan.pager_override && !scan.passthrough && scan.kf.is_none());
     }
 }

@@ -18,20 +18,17 @@ pub const CACHE_VERSION: u32 = 2;
 /// `v1/tmp` 中滞留超过这个时长的文件在剪枝时删除（§9.5）。
 const STALE_TMP: Duration = Duration::from_secs(3600);
 
-/// 缓存内容形态；两者互不命中（§9.1）。
+/// 缓存内容形态（§9.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Form {
     /// 整页的一个块。
     Page,
-    /// `-k` / `-f` 的描述批。
-    K,
 }
 
 impl Form {
     pub fn tag(self) -> &'static str {
         match self {
             Form::Page => "page",
-            Form::K => "k",
         }
     }
 }
@@ -423,15 +420,6 @@ mod tests {
         for other in changed {
             assert_ne!(base, other.unwrap());
         }
-    }
-
-    #[test]
-    fn 形态互不命中() {
-        let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        assert_ne!(
-            key(Form::Page, &parts, b"x").unwrap(),
-            key(Form::K, &parts, b"x").unwrap()
-        );
     }
 
     #[test]
