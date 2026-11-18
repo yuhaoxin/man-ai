@@ -103,24 +103,6 @@ pub fn env_refs<'a>(env: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)
         .collect()
 }
 
-/// `v1` 下的缓存条目文件数（不含 tmp）。
-pub fn entries(dir: &TempDir) -> usize {
-    let v1 = dir.file("cache").join("man-ai").join("v1");
-    fs::read_dir(&v1)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|shard| shard.file_name() != "tmp")
-        .map(|shard| {
-            fs::read_dir(shard.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .count()
-        })
-        .sum()
-}
-
 // ---------------------------------------------------------------- 普通运行
 
 pub struct Run {

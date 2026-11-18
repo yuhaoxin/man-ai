@@ -26,10 +26,6 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 阅读器正文前的第一行与全部块之后的最后一行，标明译文语言与整页翻译结果。
 
-## 形态（form）
-
-缓存键中的翻译单元形态：`page`（整页块）。
-
 ## 原因（reason）
 
 翻译失败的用户可见分类，固定五项：`not configured`、`model unreachable`、`timeout`、`backend error`、`interrupted`。
@@ -52,11 +48,13 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 缓存键 / 缓存条目（cache key / entry）
 
-缓存键是 BLAKE3-128 摘要的 32 位小写十六进制串；缓存条目是键对应文件里的译文原始字节。
+缓存键是条目文件首行 HTML 注释里的字段集合（协议版本、提示词版本、规范化端点、
+模型、思考强度、预转换全文 BLAKE3-128）；缓存条目是注释行之后的整页译文 Markdown，
+文件名 `<页名>.<section>.md` 放在语言目录下。
 
 ## 采用 / 回退（adopted / fallback）
 
-采用指该块的译文或缓存命中被写出；回退指该块写出预转换原文。尾行按块统计两者。
+采用指该块的译文被写出（整页缓存命中时是全部块一次性写出）；回退指该块写出预转换原文。尾行按块统计两者。
 
 ## 替换方式（replacement method）
 

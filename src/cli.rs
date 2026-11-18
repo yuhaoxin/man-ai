@@ -17,6 +17,8 @@ pub struct OwnArgs {
     pub lang: Option<String>,
     /// `Some(true)` = `--translate`，`Some(false)` = `--no-translate`，`None` = 没给。
     pub translate: Option<bool>,
+    /// `--retranslate`：跳过整页缓存读取（§4.1）。
+    pub retranslate: bool,
     /// `--lang` 缺值或空值时的报错文案（形状校验由 `language` 负责）。
     pub lang_error: Option<String>,
     pub rest: Vec<OsString>,
@@ -36,6 +38,7 @@ pub fn parse_own(args: &[OsString]) -> OwnArgs {
             Some("--version") => own.version = true,
             Some("--translate") => own.translate = Some(true),
             Some("--no-translate") => own.translate = Some(false),
+            Some("--retranslate") => own.retranslate = true,
             Some("--lang") => match args.get(i + 1) {
                 // §11.6：后面紧跟另一个 `--` 开头的参数也算缺值。
                 Some(next) if !next.to_string_lossy().starts_with("--") => {
@@ -268,5 +271,17 @@ mod tests {
     fn 入口扫描只看双破折号之前() {
         let scan = scan_entry(&args(&["ls", "--", "-P", "-w", "-k"]));
         assert!(!scan.pager_override && !scan.passthrough && scan.kf.is_none());
+    }
+
+    #[test]
+    fn retranslate_剥离且不透传() {
+        let own = parse_own(&args(&["--retranslate", "ls", "--translate"]));
+        assert!(own.retranslate);
+        assert_eq!(own.translate, Some(true));
+        assert_eq!(own.rest, args(&["ls"]));
+
+        let own = parse_own(&args(&["--", "--retranslate"]));
+        assert!(!own.retranslate);
+        assert_eq!(own.rest, args(&["--", "--retranslate"]));
     }
 }

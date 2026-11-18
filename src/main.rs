@@ -14,7 +14,7 @@ use man_ai::translate::{self, PipelineCtx};
 use man_ai::{blocks, cli, config, output, reader, shellmode, signals};
 
 const HELP: &str = "\
-Usage: man-ai [--lang <tag>] [--translate | --no-translate] [man arguments...]
+Usage: man-ai [--lang <tag>] [--retranslate] [--translate | --no-translate] [man arguments...]
 
 man-ai wraps man through MANPAGER: pages are rendered by the platform man,
 translated into the language chosen by --lang, and shown in a built-in
@@ -26,6 +26,7 @@ Own arguments:
   --lang <tag>    target language tag (for example zh-CN); the last one wins
   --translate     translate even when stdout is not a terminal
   --no-translate  never translate
+  --retranslate   translate again instead of using the cached translation
 
 Environment:
   MANPAGER        the thin shell writes itself here; this is the entry point
@@ -151,6 +152,7 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
             backend,
             cache,
             loaded.config.concurrency,
+            own.retranslate,
         )
     } else {
         let ctx = PipelineCtx {
@@ -158,6 +160,7 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
             backend: backend.as_ref(),
             cache: &cache,
             concurrency: loaded.config.concurrency,
+            retranslate: own.retranslate,
         };
         translate_to_stdout(page, ctx)
     }
@@ -173,6 +176,7 @@ fn translate_to_reader(
     backend: Option<Backend>,
     cache: Cache,
     concurrency: usize,
+    retranslate: bool,
 ) -> i32 {
     // 阅读器先接管终端；初始化失败时跳过翻译，预转换原文直写 stdout（§5.4）。
     let mut guard = match reader::takeover() {
@@ -192,6 +196,7 @@ fn translate_to_reader(
             backend: backend.as_ref(),
             cache: &cache,
             concurrency,
+            retranslate,
         };
         if translate::block_on(translate::run_page(page, ctx, &mut out)).is_ok() {
             let _ = out.finish();

@@ -13,7 +13,7 @@ use futures::stream;
 
 use crate::backend::{Backend, Completion, Failure, Reason};
 use crate::blocks::{Block, SplitPage};
-use crate::cache::{Cache, Form, KeyParts};
+use crate::cache::{self, Cache, KeyParts};
 use crate::language::Language;
 use crate::output::Out;
 use crate::prompt;
@@ -28,10 +28,12 @@ pub struct PipelineCtx<'a> {
     pub lang: &'a Language,
     /// `None` 表示后端未配置：不发请求，全部回退原文。
     pub backend: Option<&'a Backend>,
-    /// 块级内容寻址缓存；关闭或不可用时内部 no-op。
+    /// 整页文件缓存；关闭或不可用时内部 no-op。
     pub cache: &'a Cache,
     /// 在途请求上限（§8.1）；取值已由配置校验，至少 1。
     pub concurrency: usize,
+    /// `--retranslate`：跳过整页缓存读取，全部采用后照常覆盖写（§9.3）。
+    pub retranslate: bool,
 }
 
 /// 整页运行结果。
@@ -90,7 +92,7 @@ impl BlockResult {
 
 /// 按块序并发翻译整页并流式写出。
 ///
-/// 每块送预转换文本，失败块写预转换原文（§6.3）。
+/// 每块送预转换文本，失败块写预转换原文（§6.3）；整页缓存命中时零请求直出（§9.3）。
 pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> io::Result<Outcome> {
     out.write_header(ctx.lang.display())?;
     let system = prompt::page(ctx.lang);
@@ -115,6 +117,32 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
             reasoning_effort,
         }
     });
+    // 整页缓存键：页名从预转换文本第一行页眉解析，哈希对象是整页预转换文本。
+    let page_key = parts.and_then(|_| cache::PageKey::parse(pre_text(&page)));
+
+    /* 整页缓存命中：剥注释行直出，零请求（§9.3）；--retranslate 跳过读取。 */
+    if !ctx.retranslate
+        && let (Some(parts), Some(key)) = (parts, page_key.as_ref())
+            && let Some(body) = cache.get_page(&parts, key) {
+                let whole = Block {
+                    gap_before: 0,
+                    raw: Vec::new(),
+                    pre: String::new(),
+                };
+                out.write_block(&whole, body.as_str())?;
+                let outcome = Outcome {
+                    adopted: total,
+                    total,
+                    reason: None,
+                    deterministic: false,
+                    interrupted: false,
+                };
+                if !out.broken() {
+                    out.write_tail(&outcome)?;
+                }
+                return Ok(outcome);
+            }
+
     let system = system.as_str();
     let stop_ref = &stop;
     let results = stream::iter(page.blocks)
@@ -129,30 +157,12 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                     stop_ref.store(true, Ordering::Relaxed);
                     return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
                 };
-                /* 命中直接采用，不发请求、不重新校验（§9.3）。 */
-                if let Some(parts) = parts
-                    && let Some(hit) = cache
-                        .get(Form::Page, &parts, &block.raw)
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                {
-                    return BlockResult {
-                        block,
-                        translation: Some(hit),
-                        failure: None,
-                    };
-                }
                 match translate_block(backend, system, &block.pre, stop_ref, &cancel).await {
-                    Ok(translation) => {
-                        /* 采用后立即写，与写出顺序无关（§9.3）。 */
-                        if let Some(parts) = parts {
-                            cache.put(Form::Page, &parts, &block.raw, translation.as_bytes());
-                        }
-                        BlockResult {
-                            block,
-                            translation: Some(translation),
-                            failure: None,
-                        }
-                    }
+                    Ok(translation) => BlockResult {
+                        block,
+                        translation: Some(translation),
+                        failure: None,
+                    },
                     Err(failure) => {
                         /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
                         if stops_submission(&failure) {
@@ -166,6 +176,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         .buffered(ctx.concurrency);
     futures::pin_mut!(results);
 
+    let mut body = String::new();
     while let Some(result) = results.next().await {
         if let Some(failure) = &result.failure {
             /* 每进程最多输出一条失败诊断，取第一个失败（§10.5）。 */
@@ -188,11 +199,15 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         if result.translation.is_some() {
             adopted += 1;
         }
-        let body = match &result.translation {
+        let text = match &result.translation {
             Some(translation) => translation.as_str(),
             None => result.block.pre.as_str(),
         };
-        out.write_block(&result.block, body)?;
+        out.write_block(&result.block, text)?;
+        if let Some(translation) = &result.translation {
+            body.extend(std::iter::repeat_n('\n', result.block.gap_before));
+            body.push_str(translation);
+        }
         if let Some(line) = ctx.cache.take_warning() {
             out.diagnostic(&line);
         }
@@ -213,7 +228,23 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     if !out.broken() {
         out.write_tail(&outcome)?;
     }
+    /* 全部块采用才整页落盘；提前退出时已完整的页照常写（§9.3）。 */
+    if adopted == total && total > 0
+        && let (Some(parts), Some(key)) = (parts, page_key.as_ref()) {
+            cache.put_page(&parts, key, &body);
+        }
     Ok(outcome)
+}
+
+/// 整页预转换文本：全部块 `pre` 按 `gap_before`/`tail_gap` 重组（§9.1 哈希对象）。
+fn pre_text(page: &SplitPage) -> String {
+    let mut text = String::new();
+    for block in &page.blocks {
+        text.extend(std::iter::repeat_n('\n', block.gap_before));
+        text.push_str(&block.pre);
+    }
+    text.extend(std::iter::repeat_n('\n', page.tail_gap));
+    text
 }
 
 /// 确定性失败立即停止提交新块（§8.5）；超时与可重试失败只回退该块。

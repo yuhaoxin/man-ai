@@ -45,7 +45,7 @@ fn run_shell(dir: &TempDir, args: &str, extra_env: &[(&str, &str)], man_exit: i3
 // ---------------------------------------------------------------- --help / --version
 
 #[test]
-fn help_打印用法与五个自有参数() {
+fn help_打印用法与六个自有参数() {
     let dir = TempDir::new("t18-help");
     let out = run_pipe(&dir, &["--help"], b"", &[]);
     assert_eq!(out.code, 0);
@@ -57,6 +57,7 @@ fn help_打印用法与五个自有参数() {
         "--lang",
         "--translate",
         "--no-translate",
+        "--retranslate",
     ] {
         assert!(text.contains(own), "帮助里缺少 {own}");
     }
@@ -196,6 +197,14 @@ fn 薄壳把显式自有参数附加到_manpager() {
     assert_eq!(
         record_value(&run.record, "MANPAGER"),
         "man-ai --lang ja --no-translate"
+    );
+
+    // §4.2：--retranslate 随 MANPAGER 传递、exec man 前摘除。
+    let run = run_shell(&dir, "--retranslate --lang zh-CN ls", &[], 0);
+    assert_eq!(recorded_args(&run.record), "ls");
+    assert_eq!(
+        record_value(&run.record, "MANPAGER"),
+        "man-ai --lang zh-CN --retranslate"
     );
 }
 

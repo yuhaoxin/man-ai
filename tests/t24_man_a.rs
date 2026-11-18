@@ -55,14 +55,14 @@ fn man_a_每页各自翻译与缓存且与单页一致() {
         &bin.join("man-ai"),
         &format!("#!/bin/sh\nexec '{}' \"$@\"\n", common::BIN),
     );
-    let record = fake_multi_man(&dir, &["alpha\n", "beta\n"]);
+    let record = fake_multi_man(&dir, &["ALPHA(1)\n", "BETA(1)\n"]);
     let model = FakeModel::start_by_content(vec![
         (
-            "alpha\n".to_string(),
+            "ALPHA(1)\n".to_string(),
             Reply::Ok(completion("t-alpha\n", "stop")),
         ),
         (
-            "beta\n".to_string(),
+            "BETA(1)\n".to_string(),
             Reply::Ok(completion("t-beta\n", "stop")),
         ),
     ]);

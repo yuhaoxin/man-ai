@@ -1,6 +1,7 @@
-//! 块级内容寻址缓存（规格 §9）：键、XDG 布局、原子写、命中与剪枝。
+//! 整页文件缓存（规格 §9）：布局、键字段注释、原子写、命中与剪枝。
 //!
-//! 只存采用后的译文；关闭或不可用时整个结构退化为 no-op，调用方无需分支。
+//! 只存全部采用后的整页译文；关闭或不可用时整个结构退化为 no-op，
+//! 调用方无需分支。命中输出前剥除首行注释。
 
 use std::fs;
 use std::io::Write;
@@ -12,35 +13,43 @@ use std::time::{Duration, SystemTime};
 use crate::config::Config;
 use crate::prompt::PROMPT_VERSION;
 
-/// 回写协议、校验语义或键结构变化时递增（§9.1）。
-pub const CACHE_VERSION: u32 = 2;
+/// 缓存布局或键字段语义变化时递增（§9.1）。
+pub const CACHE_VERSION: u32 = 3;
 
-/// `v1/tmp` 中滞留超过这个时长的文件在剪枝时删除（§9.5）。
+/// `tmp/` 中滞留超过这个时长的文件在剪枝时删除（§9.5）。
 const STALE_TMP: Duration = Duration::from_secs(3600);
 
-/// 缓存内容形态（§9.1）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Form {
-    /// 整页的一个块。
-    Page,
-}
-
-impl Form {
-    pub fn tag(self) -> &'static str {
-        match self {
-            Form::Page => "page",
-        }
-    }
-}
-
-/// 键里除输入字节外的固定部分；`endpoint` 传配置原值，进键前规范化。
+/// 键字段中除页名与哈希外的固定部分（§9.1）；`endpoint` 传配置原值，
+/// 进注释前规范化。
 #[derive(Debug, Clone, Copy)]
 pub struct KeyParts<'a> {
+    /// 语言规范标签，同时是语言目录名。
     pub lang: &'a str,
     pub endpoint: &'a str,
     pub model: &'a str,
     /// 实际发送的思考强度；`off` 表示配置为空、不发送。
     pub reasoning_effort: &'a str,
+}
+
+/// 整页缓存键：页眉解析出的页名与整页预转换文本（§9.1）。
+pub struct PageKey {
+    name: String,
+    section: String,
+    /// 哈希对象：全部块 `pre` 按 `gap_before`/`tail_gap` 重组后的字节。
+    pre: String,
+}
+
+impl PageKey {
+    /// 第一行页眉 `NAME(SECTION)` 解析失败时返回 `None`，该页不缓存（§9.1）。
+    pub fn parse(pre: String) -> Option<Self> {
+        let first = pre.split('\n').next().unwrap_or_default();
+        let (name, section) = parse_header(first)?;
+        Some(Self { name, section, pre })
+    }
+
+    fn file_stem(&self) -> String {
+        format!("{}.{}", self.name, self.section)
+    }
 }
 
 /// 关闭或不可用时 `state` 为 `None`，所有操作 no-op。
@@ -64,27 +73,35 @@ impl Cache {
         self.state.is_some()
     }
 
-    /// 命中直接返回文件内容；读失败按 miss。
-    pub fn get(&self, form: Form, parts: &KeyParts<'_>, input: &[u8]) -> Option<Vec<u8>> {
+    /// 整页命中：返回剥除注释行后的整页译文；读失败或键字段不一致按 miss（§9.3）。
+    /// 命中只读，不更新 mtime。
+    pub fn get_page(&self, parts: &KeyParts<'_>, key: &PageKey) -> Option<String> {
         let state = self.state.as_ref()?;
-        let key = key(form, parts, input)?;
-        fs::read(entry(&state.root, &key)).ok()
+        let comment = comment_line(parts, key)?;
+        let content = fs::read_to_string(entry_path(&state.root, parts.lang, key)).ok()?;
+        Some(
+            content
+                .strip_prefix(&comment)?
+                .strip_prefix('\n')?
+                .to_string(),
+        )
     }
 
-    /// 采用之后立即写；失败只记一条告警，不影响翻译。
-    pub fn put(&self, form: Form, parts: &KeyParts<'_>, input: &[u8], value: &[u8]) {
+    /// 整页落盘：注释行 + 译文，覆盖旧条目；失败只记一条告警（§9.2、§9.3）。
+    pub fn put_page(&self, parts: &KeyParts<'_>, key: &PageKey, body: &str) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let Some(key) = key(form, parts, input) else {
+        let Some(comment) = comment_line(parts, key) else {
             return;
         };
-        if write_atomic(&state.root, &entry(&state.root, &key), value).is_err()
+        let value = format!("{comment}\n{body}");
+        let target = entry_path(&state.root, parts.lang, key);
+        if write_atomic(&state.root, &target, value.as_bytes()).is_err()
             && let Ok(mut slot) = state.warning.lock()
-            && slot.is_none()
-        {
-            *slot = Some("cache write failed; continuing without cache".to_string());
-        }
+                && slot.is_none() {
+                    *slot = Some("cache write failed; continuing without cache".to_string());
+                }
     }
 
     /// 取走待输出的告警；管线据此在分页器启动前写 stderr（§5.5）。
@@ -92,22 +109,23 @@ impl Cache {
         self.state.as_ref()?.warning.lock().ok()?.take()
     }
 
-    /// 按总大小剪枝到上限的 80%，并清掉陈旧的临时文件（§9.5）。`0` 表示不限。
+    /// 删除旧 `v1/` 布局、清陈旧 tmp、按总大小剪枝到上限的 80%（§9.5）。
+    /// `0` 表示不限大小。
     pub fn prune(&self, max_mb: u64) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let v1 = state.root.join("v1");
-        remove_stale_tmp(&v1.join("tmp"));
+        let _ = fs::remove_dir_all(state.root.join("v1"));
+        remove_stale_tmp(&state.root.join("tmp"));
         if max_mb == 0 {
             return;
         }
         let limit = max_mb.saturating_mul(1024 * 1024);
         let mut entries = Vec::new();
         let mut total: u64 = 0;
-        for shard in fs::read_dir(&v1).into_iter().flatten().flatten() {
-            let path = shard.path();
-            if path.file_name().is_some_and(|name| name == "tmp") {
+        for lang_dir in fs::read_dir(&state.root).into_iter().flatten().flatten() {
+            let path = lang_dir.path();
+            if !path.is_dir() || path.file_name().is_some_and(|name| name == "tmp") {
                 continue;
             }
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
@@ -189,10 +207,9 @@ fn root_path(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
 
 /// 建目录、设权限、校验属主与可写性；任何一项失败都降级为 no-op。
 fn prepare(root: &Path) -> Result<(), String> {
-    let v1 = root.join("v1");
-    let tmp = v1.join("tmp");
+    let tmp = root.join("tmp");
     fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
-    for dir in [root, &v1, &tmp] {
+    for dir in [root, &tmp] {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
     }
@@ -209,11 +226,12 @@ fn prepare(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `v1/<键前 2 位>/<完整键>`（§9.2）。
-fn entry(root: &Path, key: &str) -> PathBuf {
-    root.join("v1").join(&key[..2]).join(key)
+/// `<语言规范标签>/<页名>.<section>.md`（§9.1）。
+fn entry_path(root: &Path, lang: &str, key: &PageKey) -> PathBuf {
+    root.join(lang).join(format!("{}.md", key.file_stem()))
 }
 
+/// 同目录 `tmp/` 写完再 `rename`，语言目录按需创建并设 `0700`（§9.2）。
 fn write_atomic(root: &Path, target: &Path, value: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = target.parent() {
         fs::create_dir_all(dir)?;
@@ -221,7 +239,7 @@ fn write_atomic(root: &Path, target: &Path, value: &[u8]) -> std::io::Result<()>
     }
     let mut file = tempfile::Builder::new()
         .prefix(&format!("{}-", std::process::id()))
-        .tempfile_in(root.join("v1").join("tmp"))?;
+        .tempfile_in(root.join("tmp"))?;
     file.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(value)?;
@@ -246,52 +264,23 @@ fn remove_stale_tmp(tmp: &Path) {
     }
 }
 
-/// 键 = BLAKE3-128，32 位小写十六进制（§9.1）。端点无法规范化时返回 `None`。
-pub fn key(form: Form, parts: &KeyParts<'_>, input: &[u8]) -> Option<String> {
+/// 首行注释：键字段以单个空格分隔，值中空格转 `%20`（§9.1）。
+/// 端点无法规范化时返回 `None`，该页不读不写。
+fn comment_line(parts: &KeyParts<'_>, key: &PageKey) -> Option<String> {
     let endpoint = normalize_endpoint(parts.endpoint)?;
-    Some(key_versioned(
-        (CACHE_VERSION, PROMPT_VERSION),
-        form,
-        parts.lang,
-        &endpoint,
-        parts.model,
-        parts.reasoning_effort,
-        input,
+    Some(format!(
+        "<!-- v={} prompt={} endpoint={} model={} reasoning={} hash={} -->",
+        CACHE_VERSION,
+        PROMPT_VERSION,
+        escape(&endpoint),
+        escape(parts.model),
+        escape(parts.reasoning_effort),
+        hex16(blake3::hash(key.pre.as_bytes()).as_bytes()),
     ))
 }
 
-/// 版本号可注入，便于测试旧键不命中。
-fn key_versioned(
-    (cache_version, prompt_version): (u32, u32),
-    form: Form,
-    lang: &str,
-    endpoint: &str,
-    model: &str,
-    reasoning_effort: &str,
-    input: &[u8],
-) -> String {
-    let cache_version = cache_version.to_string();
-    let prompt_version = prompt_version.to_string();
-    let mut hasher = blake3::Hasher::new();
-    for field in [
-        cache_version.as_bytes(),
-        prompt_version.as_bytes(),
-        form.tag().as_bytes(),
-        lang.as_bytes(),
-        endpoint.as_bytes(),
-        model.as_bytes(),
-        reasoning_effort.as_bytes(),
-    ] {
-        feed(&mut hasher, field);
-    }
-    feed(&mut hasher, input);
-    hex16(hasher.finalize().as_bytes())
-}
-
-/// 每段前置 8 字节小端长度，防止相邻字段拼接出歧义（§9.1）。
-fn feed(hasher: &mut blake3::Hasher, field: &[u8]) {
-    hasher.update(&(field.len() as u64).to_le_bytes());
-    hasher.update(field);
+fn escape(value: &str) -> String {
+    value.replace(' ', "%20")
 }
 
 fn hex16(digest: &[u8; 32]) -> String {
@@ -299,6 +288,25 @@ fn hex16(digest: &[u8; 32]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// 页眉 `NAME(SECTION)`：页名转小写；页名与 section 只接受文件名安全字符，
+/// 含其它字符（空格、路径分隔符等）视为解析失败（§9.1）。
+fn parse_header(line: &str) -> Option<(String, String)> {
+    // 预转换把粗体页眉转成 `**NAME(SECTION)**`，先剥掉强调标记。
+    let line = line.trim().trim_matches('*').trim();
+    let body = line.strip_suffix(')')?;
+    let open = body.rfind('(')?;
+    let (name, section) = (&body[..open], &body[open + 1..]);
+    let safe =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | ':' | '~' | '-');
+    if name.is_empty() || section.is_empty() {
+        return None;
+    }
+    if !name.chars().all(safe) || !section.chars().all(safe) {
+        return None;
+    }
+    Some((name.to_ascii_lowercase(), section.to_string()))
 }
 
 /// scheme/host 小写、去默认端口、去尾部 `/`；query 或 fragment 不接受（§9.1）。
@@ -348,77 +356,46 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn blake3_128_已知向量() {
-        assert_eq!(
-            hex16(blake3::hash(b"abc").as_bytes()),
-            "6437b3ac38465133ffb63b75273a8db5"
-        );
+    fn put_entry(dir: &tempfile::TempDir, lang: &str, stem: &str, size: usize) -> PathBuf {
+        let path = dir
+            .path()
+            .join("man-ai")
+            .join(lang)
+            .join(format!("{stem}.md"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![b'x'; size]).unwrap();
+        path
     }
 
     #[test]
-    fn 键是32位小写十六进制() {
-        let key = key(
-            Form::Page,
-            &parts("zh-CN", "https://api.example.com/v1", "m"),
-            b"hello\n",
-        )
-        .unwrap();
-        assert_eq!(key.len(), 32);
-        assert!(
-            key.bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        );
-    }
-
-    #[test]
-    fn 长度前缀防止拼接歧义() {
-        let left = key(Form::Page, &parts("ab", "https://example.com", "c"), b"").unwrap();
-        let right = key(Form::Page, &parts("a", "https://example.com", "bc"), b"").unwrap();
-        assert_ne!(left, right);
-    }
-
-    #[test]
-    fn 任一段变化键就变化() {
-        let base = key(
-            Form::Page,
-            &parts("zh-CN", "https://api.example.com/v1", "m"),
-            b"input\n",
-        )
-        .unwrap();
-        let changed = [
-            key(
-                Form::Page,
-                &parts("ja", "https://api.example.com/v1", "m"),
-                b"input\n",
-            ),
-            key(
-                Form::Page,
-                &parts("zh-CN", "https://api.example.com/v2", "m"),
-                b"input\n",
-            ),
-            key(
-                Form::Page,
-                &parts("zh-CN", "https://api.example.com/v1", "other"),
-                b"input\n",
-            ),
-            key(
-                Form::Page,
-                &KeyParts {
-                    reasoning_effort: "high",
-                    ..parts("zh-CN", "https://api.example.com/v1", "m")
-                },
-                b"input\n",
-            ),
-            key(
-                Form::Page,
-                &parts("zh-CN", "https://api.example.com/v1", "m"),
-                b"input!\n",
-            ),
+    fn 页眉解析() {
+        let table = [
+            ("LS(1)", Some(("ls", "1"))),
+            ("**LS(1)**", Some(("ls", "1"))),
+            ("Curl-Config(1)", Some(("curl-config", "1"))),
+            ("x509(1ssl)", Some(("x509", "1ssl"))),
+            ("mwm(1x)", Some(("mwm", "1x"))),
+            ("LS (1)", None),
+            ("ls", None),
+            ("(1)", None),
+            ("ls()", None),
+            ("a b(1)", None),
+            ("../evil(1)", None),
+            ("a(b)(1)", None),
         ];
-        for other in changed {
-            assert_ne!(base, other.unwrap());
+        for (line, expected) in table {
+            let expected = expected.map(|(name, section)| (name.to_string(), section.to_string()));
+            assert_eq!(parse_header(line), expected, "{line}");
         }
+    }
+
+    #[test]
+    fn 无页眉或首行为空的页不缓存() {
+        assert!(PageKey::parse(String::new()).is_none());
+        assert!(PageKey::parse("\nLS(1)\n".to_string()).is_none());
+        assert!(PageKey::parse("plain page\n".to_string()).is_none());
+        let key = PageKey::parse("LS(1)\nbody\n".to_string()).unwrap();
+        assert_eq!(key.file_stem(), "ls.1");
     }
 
     #[test]
@@ -445,108 +422,165 @@ mod tests {
     }
 
     #[test]
-    fn 版本变化后键不同() {
-        let left = key_versioned(
-            (1, 2),
-            Form::Page,
-            "zh-CN",
-            "https://e.com",
-            "m",
-            "low",
-            b"x",
+    fn 注释字段与预转换哈希() {
+        let key = PageKey::parse("LS(1)\nbody\n".to_string()).unwrap();
+        let parts = parts("zh-CN", "https://api.example.com:443/v1/", "test model");
+        let comment = comment_line(&parts, &key).unwrap();
+        let fields: Vec<(&str, &str)> = comment[5..comment.len() - 4]
+            .split(' ')
+            .map(|field| field.split_once('=').unwrap())
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ("v", "3"),
+                ("prompt", "3"),
+                ("endpoint", "https://api.example.com/v1"),
+                ("model", "test%20model"),
+                ("reasoning", "low"),
+                ("hash", "7f063821988e288503bb9cc55c4d108d"),
+            ],
+            "{comment}"
         );
-        let cache_bump = key_versioned(
-            (2, 2),
-            Form::Page,
-            "zh-CN",
-            "https://e.com",
-            "m",
-            "low",
-            b"x",
+        // 哈希对象是整页预转换文本的 BLAKE3-128。
+        assert_eq!(
+            hex16(blake3::hash(b"LS(1)\nbody\n").as_bytes()),
+            "7f063821988e288503bb9cc55c4d108d"
         );
-        let prompt_bump = key_versioned(
-            (1, 3),
-            Form::Page,
-            "zh-CN",
-            "https://e.com",
-            "m",
-            "low",
-            b"x",
-        );
-        let effort_bump = key_versioned(
-            (1, 2),
-            Form::Page,
-            "zh-CN",
-            "https://e.com",
-            "m",
-            "high",
-            b"x",
-        );
-        assert_ne!(left, cache_bump);
-        assert_ne!(left, prompt_bump);
-        assert_ne!(left, effort_bump);
-        assert_ne!(cache_bump, prompt_bump);
     }
 
     #[test]
-    fn 路径布局与权限() {
-        let dir = temp("layout");
+    fn 落盘命中与键字段逐一比对() {
+        let dir = temp("roundtrip");
         let cache = cache_in(&dir);
-        let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        cache.put(Form::Page, &parts, b"block\n", "译文\n".as_bytes());
-        let key = key(Form::Page, &parts, b"block\n").unwrap();
+        let key = PageKey::parse("LS(1)\nbody\n".to_string()).unwrap();
+        let base = parts("zh-CN", "https://api.example.com/v1", "m");
+        assert!(cache.get_page(&base, &key).is_none());
+        cache.put_page(&base, &key, "译文\n");
+        assert_eq!(cache.get_page(&base, &key).unwrap(), "译文\n");
+
         let path = dir
             .path()
-            .join("man-ai")
-            .join("v1")
-            .join(&key[..2])
-            .join(&key);
-        assert_eq!(fs::read(&path).unwrap(), b"\xe8\xaf\x91\xe6\x96\x87\n");
-        for dir_path in [
-            path.parent().unwrap().to_path_buf(),
-            dir.path().join("man-ai"),
+            .join("man-ai/zh-CN")
+            .join(format!("{}.md", key.file_stem()));
+        let stored = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            stored,
+            "<!-- v=3 prompt=3 endpoint=https://api.example.com/v1 model=m reasoning=low hash=7f063821988e288503bb9cc55c4d108d -->\n译文\n"
+        );
+
+        // 任一键字段变化即不命中。
+        for changed in [
+            KeyParts {
+                endpoint: "https://api.example.com/v2",
+                ..base
+            },
+            KeyParts {
+                model: "other",
+                ..base
+            },
+            KeyParts {
+                reasoning_effort: "high",
+                ..base
+            },
         ] {
-            let mode = fs::metadata(&dir_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "{}", dir_path.display());
+            assert!(cache.get_page(&changed, &key).is_none(), "{changed:?}");
         }
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        assert_eq!(
-            fs::read_dir(dir.path().join("man-ai/v1/tmp"))
-                .unwrap()
-                .count(),
-            0
-        );
-        assert_eq!(
-            cache.get(Form::Page, &parts, b"block\n").unwrap(),
-            b"\xe8\xaf\x91\xe6\x96\x87\n"
-        );
+        // 预转换文本变化（哈希变化）即不命中；页名不同是另一个文件。
+        let edited = PageKey::parse("LS(1)\nbody edited\n".to_string()).unwrap();
+        assert!(cache.get_page(&base, &edited).is_none());
+        let other = PageKey::parse("MV(1)\nbody\n".to_string()).unwrap();
+        assert!(cache.get_page(&base, &other).is_none());
+        // 语言由目录承载：换语言是另一份条目。
+        let ja = parts("ja", "https://api.example.com/v1", "m");
+        assert!(cache.get_page(&ja, &key).is_none());
+        cache.put_page(&ja, &key, "訳文\n");
+        assert_eq!(cache.get_page(&ja, &key).unwrap(), "訳文\n");
+        assert!(dir.path().join("man-ai/ja").join("ls.1.md").exists());
     }
 
     #[test]
     fn 命中不更新_mtime() {
         let dir = temp("mtime");
         let cache = cache_in(&dir);
+        let key = PageKey::parse("LS(1)\n".to_string()).unwrap();
         let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        cache.put(Form::Page, &parts, b"block\n", b"v");
-        let key = key(Form::Page, &parts, b"block\n").unwrap();
-        let path = entry(&dir.path().join("man-ai"), &key);
+        cache.put_page(&parts, &key, "v\n");
+        let path = dir
+            .path()
+            .join("man-ai/zh-CN")
+            .join(format!("{}.md", key.file_stem()));
         let old = SystemTime::now() - Duration::from_secs(86_400);
         set_mtime(&path, old);
-        assert_eq!(cache.get(Form::Page, &parts, b"block\n").unwrap(), b"v");
+        assert_eq!(cache.get_page(&parts, &key).unwrap(), "v\n");
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
+    }
+
+    #[test]
+    fn 端点无法规范化的页不读不写() {
+        let dir = temp("bad-endpoint");
+        let cache = cache_in(&dir);
+        let key = PageKey::parse("LS(1)\n".to_string()).unwrap();
+        let parts = parts("zh-CN", "https://example.com/v1?x=1", "m");
+        assert!(cache.get_page(&parts, &key).is_none());
+        cache.put_page(&parts, &key, "v\n");
+        assert!(!dir.path().join("man-ai/zh-CN").exists());
+    }
+
+    #[test]
+    fn 路径布局与权限() {
+        let dir = temp("layout");
+        let cache = cache_in(&dir);
+        let key = PageKey::parse("LS(1)\n".to_string()).unwrap();
+        let parts = parts("zh-CN", "https://api.example.com/v1", "m");
+        cache.put_page(&parts, &key, "译文\n");
+        let path = dir
+            .path()
+            .join("man-ai/zh-CN")
+            .join(format!("{}.md", key.file_stem()));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            "<!-- v=3 prompt=3 endpoint=https://api.example.com/v1 model=m reasoning=low hash=1b8056e2b8f4fd9e72a6c1b9b3f1c305 -->\n译文\n"
+                .as_bytes()
+        );
+        let mode = fs::metadata(dir.path().join("man-ai"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            fs::read_dir(dir.path().join("man-ai/tmp")).unwrap().count(),
+            0
+        );
     }
 
     #[test]
     fn 读失败按_miss() {
         let dir = temp("miss");
         let cache = cache_in(&dir);
+        let key = PageKey::parse("LS(1)\n".to_string()).unwrap();
         let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        assert!(cache.get(Form::Page, &parts, b"block\n").is_none());
-        cache.put(Form::Page, &parts, b"block\n", b"v");
-        let key = key(Form::Page, &parts, b"block\n").unwrap();
-        fs::remove_file(entry(&dir.path().join("man-ai"), &key)).unwrap();
-        assert!(cache.get(Form::Page, &parts, b"block\n").is_none());
+        assert!(cache.get_page(&parts, &key).is_none());
+        cache.put_page(&parts, &key, "v\n");
+        let path = dir
+            .path()
+            .join("man-ai/zh-CN")
+            .join(format!("{}.md", key.file_stem()));
+        fs::remove_file(&path).unwrap();
+        assert!(cache.get_page(&parts, &key).is_none());
+        // 首行不是合法注释也按 miss。
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not a comment\n译文\n").unwrap();
+        assert!(cache.get_page(&parts, &key).is_none());
     }
 
     #[test]
@@ -559,9 +593,10 @@ mod tests {
         let (cache, warning) = open(&config);
         assert_eq!(warning, None);
         assert!(!cache.enabled());
+        let key = PageKey::parse("LS(1)\n".to_string()).unwrap();
         let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        cache.put(Form::Page, &parts, b"block\n", b"v");
-        assert!(cache.get(Form::Page, &parts, b"block\n").is_none());
+        cache.put_page(&parts, &key, "v\n");
+        assert!(cache.get_page(&parts, &key).is_none());
         assert!(!dir.path().join("man-ai").exists());
     }
 
@@ -588,65 +623,64 @@ mod tests {
     }
 
     #[test]
-    fn 并发写同键内容完整() {
+    fn 并发写同页内容完整() {
         let dir = temp("concurrent");
         let cache = cache_in(&dir);
+        let key = PageKey::parse("LS(1)\n".to_string()).unwrap();
         let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        let values: Vec<Vec<u8>> = (0..8u8).map(|byte| vec![byte; 64 * 1024]).collect();
+        let values: Vec<String> = (0..8u8)
+            .map(|byte| format!("{}\n", "x".repeat(byte as usize + 1)))
+            .collect();
         std::thread::scope(|scope| {
             for value in &values {
-                scope.spawn(|| cache.put(Form::Page, &parts, b"block\n", value));
+                scope.spawn(|| cache.put_page(&parts, &key, value));
             }
         });
-        let stored = cache.get(Form::Page, &parts, b"block\n").unwrap();
-        assert!(values.contains(&stored));
+        let stored = cache.get_page(&parts, &key).unwrap();
+        assert!(values.contains(&stored), "{stored}");
     }
 
     #[test]
-    fn 剪枝超限按最旧优先删到八成() {
+    fn 剪枝超限按最旧优先删到八成并清_v1_与陈旧_tmp() {
         let dir = temp("prune");
         let cache = cache_in(&dir);
-        let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        let keys: Vec<String> = (0..4)
-            .map(|index| {
-                let input = format!("block{index}\n");
-                cache.put(Form::Page, &parts, input.as_bytes(), &vec![b'x'; 400_000]);
-                key(Form::Page, &parts, input.as_bytes()).unwrap()
-            })
-            .collect();
-        let root = dir.path().join("man-ai");
         let old = SystemTime::now() - Duration::from_secs(86_400);
-        for (index, key) in keys.iter().enumerate() {
-            let path = entry(&root, key);
-            set_mtime(&path, old + Duration::from_secs(index as u64 * 60));
+        let mut paths = Vec::new();
+        for (lang, stem) in [
+            ("zh-CN", "a.1"),
+            ("zh-CN", "b.1"),
+            ("ja", "c.1"),
+            ("ja", "d.1"),
+        ] {
+            let path = put_entry(&dir, lang, stem, 400_000);
+            set_mtime(&path, old + Duration::from_secs(paths.len() as u64 * 60));
+            paths.push(path);
         }
+        // 旧哈希布局目录与滞留的 tmp 文件一并清除。
+        let v1 = dir.path().join("man-ai/v1/ab/abcd");
+        fs::create_dir_all(&v1).unwrap();
+        fs::write(v1.join("abcd"), b"old").unwrap();
+        let stale = dir.path().join("man-ai/tmp/42-0");
+        fs::write(&stale, b"stale").unwrap();
+        set_mtime(&stale, SystemTime::now() - Duration::from_secs(2 * 3600));
+
         cache.prune(1);
-        let alive: Vec<bool> = keys.iter().map(|key| entry(&root, key).exists()).collect();
+
+        let alive: Vec<bool> = paths.iter().map(|path| path.exists()).collect();
         assert_eq!(alive, vec![false, false, true, true]);
-    }
-
-    #[test]
-    fn 剪枝零表示不限() {
-        let dir = temp("nolimit");
-        let cache = cache_in(&dir);
-        let parts = parts("zh-CN", "https://api.example.com/v1", "m");
-        cache.put(Form::Page, &parts, b"a\n", &vec![b'x'; 1_500_000]);
-        cache.prune(0);
-        assert!(cache.get(Form::Page, &parts, b"a\n").is_some());
-    }
-
-    #[test]
-    fn 剪枝删除超过一小时的临时文件() {
-        let dir = temp("stale");
-        let cache = cache_in(&dir);
-        let tmp = dir.path().join("man-ai/v1/tmp");
-        let stale = tmp.join("1-old");
-        let fresh = tmp.join("1-new");
-        fs::write(&stale, b"x").unwrap();
-        fs::write(&fresh, b"x").unwrap();
-        set_mtime(&stale, SystemTime::now() - Duration::from_secs(7200));
-        cache.prune(0);
+        assert!(!dir.path().join("man-ai/v1").exists());
         assert!(!stale.exists());
-        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn 零上限只清理不剪枝() {
+        let dir = temp("prune-zero");
+        let cache = cache_in(&dir);
+        let path = put_entry(&dir, "zh-CN", "a.1", 10);
+        let v1 = dir.path().join("man-ai/v1");
+        fs::create_dir_all(&v1).unwrap();
+        cache.prune(0);
+        assert!(path.exists());
+        assert!(!v1.exists());
     }
 }
