@@ -1,6 +1,6 @@
 # 0003 缓存键：块级内容寻址
 
-- 状态：接受
+- 状态：被 [0005](0005-page-file-cache.md) 取代
 - 日期：2026-11-12
 - 决策来源：[#7](https://github.com/yuhaoxin/man-ai/issues/7)、[#5](https://github.com/yuhaoxin/man-ai/issues/5)、[#8](https://github.com/yuhaoxin/man-ai/issues/8)、[#9](https://github.com/yuhaoxin/man-ai/issues/9)
 
