@@ -47,7 +47,7 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
         }
     }
     save_manpager();
-    set_env("MANPAGER", manpager_value(lang, own.translate));
+    set_env("MANPAGER", manpager_value(lang, own.retranslate, own.translate));
     exec_man(&own.rest)
 }
 
@@ -113,6 +113,7 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
         backend: backend.as_ref(),
         cache: &cache,
         concurrency: config.concurrency,
+        retranslate: own.retranslate,
     };
     if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out)) {
         if outcome.all_failed() {
@@ -128,12 +129,15 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
     code
 }
 
-/// `MANPAGER="man-ai [--lang <规范标签>] [--translate|--no-translate]"`（§4.2）。
-fn manpager_value(lang: Option<&str>, translate: Option<bool>) -> String {
+/// `MANPAGER="man-ai [--lang <规范标签>] [--retranslate] [--translate|--no-translate]"`（§4.2）。
+fn manpager_value(lang: Option<&str>, retranslate: bool, translate: Option<bool>) -> String {
     let mut value = String::from("man-ai");
     if let Some(tag) = lang {
         value.push_str(" --lang ");
         value.push_str(tag);
+    }
+    if retranslate {
+        value.push_str(" --retranslate");
     }
     match translate {
         Some(true) => value.push_str(" --translate"),
@@ -173,12 +177,19 @@ mod tests {
 
     #[test]
     fn manpager_值按规格拼接() {
-        assert_eq!(manpager_value(None, None), "man-ai");
-        assert_eq!(manpager_value(Some("zh-CN"), None), "man-ai --lang zh-CN");
-        assert_eq!(manpager_value(None, Some(true)), "man-ai --translate");
+        assert_eq!(manpager_value(None, false, None), "man-ai");
         assert_eq!(
-            manpager_value(Some("ja"), Some(false)),
+            manpager_value(Some("zh-CN"), false, None),
+            "man-ai --lang zh-CN"
+        );
+        assert_eq!(manpager_value(None, false, Some(true)), "man-ai --translate");
+        assert_eq!(
+            manpager_value(Some("ja"), false, Some(false)),
             "man-ai --lang ja --no-translate"
+        );
+        assert_eq!(
+            manpager_value(Some("zh-CN"), true, Some(true)),
+            "man-ai --lang zh-CN --retranslate --translate"
         );
     }
 }

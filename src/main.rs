@@ -12,7 +12,7 @@ use man_ai::translate::PipelineCtx;
 use man_ai::{blocks, cli, config, output, pager, shellmode, translate};
 
 const HELP: &str = "\
-Usage: man-ai [--lang <tag>] [--translate | --no-translate] [man arguments...]
+Usage: man-ai [--lang <tag>] [--retranslate] [--translate | --no-translate] [man arguments...]
 
 man-ai wraps man through MANPAGER: pages are rendered by the platform man and
 translated into the language chosen by --lang.
@@ -23,6 +23,7 @@ Own arguments:
   --lang <tag>    target language tag (for example zh-CN); the last one wins
   --translate     translate even when stdout is not a terminal
   --no-translate  never translate
+  --retranslate   translate again instead of using the cached translation
 
 Environment:
   MANPAGER        the thin shell writes itself here; this is the entry point
@@ -139,6 +140,7 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
         backend: backend.as_ref(),
         cache: &cache,
         concurrency: loaded.config.concurrency,
+        retranslate: own.retranslate,
     };
     let outcome = match translate::block_on(translate::run_page(page, ctx, &mut out)) {
         Ok(outcome) => outcome,
