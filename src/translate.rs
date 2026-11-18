@@ -304,7 +304,7 @@ async fn post(
 }
 
 /// §7.3 返回加工：剥掉首尾纯空行；行内与行尾空格保留（可能是排版）。
-pub fn postprocess(raw: &str) -> String {
+fn postprocess(raw: &str) -> String {
     strip_blank_edges(raw)
 }
 
