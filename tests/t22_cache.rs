@@ -211,6 +211,12 @@ fn 命中零请求且阅读器输出一致() {
         assert!(compact.contains("页眉译文"), "{compact}");
         assert!(compact.contains("正文译文"), "{compact}");
     }
+    // 第二次是整页缓存命中：零请求，状态行只有 elapsed 与 cache hit（§8.3）。
+    let hit = common::compact(&second.text());
+    // 帧流里最后的指标行是 cache hit（§8.3）：帧 diff 只重写变化格，
+    // 旧状态行 `tps` 的 `t` 与新 `hit` 的 `t` 同位，流里是 `cachehi`；
+    // 完整形态由阅读器单元测试断言。
+    assert!(hit.contains("cachehi"), "{hit}");
     assert_eq!(first.code, 0);
     assert_eq!(second.code, 0);
 }

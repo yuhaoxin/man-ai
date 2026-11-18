@@ -63,6 +63,9 @@ fn 接管终端_占位行_按序正文_q_退出零() {
         "{text}"
     );
     assert!(text.contains("elapsed"), "{text}");
+    // 状态行整页指标（§8.3）：首帧完整画出五字段；数值口径在单元层断言，
+    // 帧 diff 之后只重写变化格，故断言取首帧整行形态。
+    assert!(text.contains("out0·tps–·cached0·in0"), "{text}");
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }
 
@@ -261,8 +264,10 @@ fn 不翻译的_tty_页面进阅读器显示预转换原文() {
     assert!(!text.contains("──man-ai:translated"), "{text}");
     assert!(text.contains("ls-list"), "{text}");
     assert!(text.contains("plain"), "{text}");
-    // 状态行只有 elapsed。
+    // 状态行只有 elapsed（§8.2），无指标字段。
     assert!(text.contains("elapsed"), "{text}");
+    assert!(!text.contains("out"), "{text}");
+    assert!(!text.contains("tps"), "{text}");
     // 不发请求、不查缓存。
     assert_eq!(model.count(), 0);
     assert!(run.stderr.is_empty(), "{}", run.stderr);

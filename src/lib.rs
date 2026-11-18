@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod blocks;
 pub mod cache;
+pub mod metrics;
 pub mod cli;
 pub mod config;
 pub mod language;
