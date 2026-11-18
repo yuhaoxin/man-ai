@@ -468,7 +468,8 @@ where
     } else if libc::WIFSIGNALED(raw_status) {
         128 + libc::WTERMSIG(raw_status) as i32
     } else {
-        0
+        // waitpid 只报告退出或信号终止两种处置；其它状态在契约之外。
+        unreachable!("waitpid 状态既非退出也非信号: {raw_status}")
     };
     ReaderRun {
         raw: seen.lock().unwrap().clone(),

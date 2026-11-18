@@ -2,6 +2,8 @@
 //!
 //! 重试与回退不在这里：`post` 恰好发一次请求，由 `translate` 决定是否重试。
 //! `with_http_service(ReqwestService)` 是必须的，否则 async-openai 会自己重试 3 次。
+//! 响应用 byot 反序列化成自有类型：usage 字段缺失按未知（§8.3），端点载荷不全
+//! 不再让整帧反序列化失败。
 use std::time::Duration;
 
 use async_openai::config::OpenAIConfig;
@@ -9,12 +11,14 @@ use async_openai::error::OpenAIError;
 use async_openai::middleware::ReqwestService;
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestUserMessage, ChatCompletionStreamOptions,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, FinishReason, ReasoningEffort,
+    ChatCompletionRequestUserMessage, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, ReasoningEffort,
 };
 
 use async_openai::{Chat, Client};
 use futures::StreamExt;
+
+use serde::Deserialize;
 
 use crate::config::{Config, ReasoningEffort as ConfigEffort};
 
@@ -75,23 +79,98 @@ pub struct Completion {
     pub usage: Option<Usage>,
 }
 
-/// 一次请求的 usage 原始值（§8.3 三口径的输入；cached 缺失即未知）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    /// `prompt_tokens_details.cached_tokens`；缺失即未知。
-    pub cached_tokens: Option<u32>,
+impl Completion {
+    fn empty() -> Self {
+        Self {
+            content: String::new(),
+            stopped: false,
+            usage: None,
+        }
+    }
+
+    /// 并进一帧（§7.3）：只累积 `choices[0]` 的 `delta.content`，finish_reason
+    /// 也只认该 choice 的；其余 choice 一律忽略。usage 取最后一个非空块（§7.5）。
+    fn fold(&mut self, chunk: StreamChunk, on_delta: &mut dyn FnMut(&str)) {
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage.into());
+        }
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return;
+        };
+        if let Some(text) = choice.delta.content {
+            self.content.push_str(&text);
+            on_delta(&text);
+        }
+        if let Some(reason) = choice.finish_reason {
+            self.stopped = reason == "stop";
+        }
+    }
 }
 
-impl Usage {
-    fn from_completion(usage: async_openai::types::chat::CompletionUsage) -> Self {
+/// 一次请求的 usage 原始值（§8.3 三口径的输入）。字段缺失即未知，不按 0 补；
+/// cache_write_tokens 缺失按 0：provider 未写入缓存。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    /// `prompt_tokens_details.cached_tokens`；缺失即未知。
+    pub cached_tokens: Option<u32>,
+    /// `prompt_tokens_details.cache_write_tokens`；缺失按 0 扣减。
+    pub cache_write_tokens: Option<u32>,
+}
+
+/// SSE 帧的自有反序列化形状（byot）：字段全部可缺，缺失即未知或空，
+/// 不因端点载荷不全而反序列化失败（§8.3）。
+#[derive(Deserialize)]
+struct StreamChunk {
+    /// 只有 `choices[0]` 参与（§7.3）。
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<RawUsage>,
+    /// OpenAI 兼容端点把流内错误写成 error 帧；出现即失败。
+    #[serde(default)]
+    error: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// usage 载荷：字段缺失即未知，不按 0 补（§8.3）。
+#[derive(Deserialize)]
+struct RawUsage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<RawPromptDetails>,
+}
+
+#[derive(Deserialize)]
+struct RawPromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
+}
+
+impl From<RawUsage> for Usage {
+    fn from(raw: RawUsage) -> Self {
+        let details = raw.prompt_tokens_details;
         Self {
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            cached_tokens: usage
-                .prompt_tokens_details
-                .and_then(|details| details.cached_tokens),
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            cached_tokens: details.as_ref().and_then(|details| details.cached_tokens),
+            cache_write_tokens: details.and_then(|details| details.cache_write_tokens),
         }
     }
 }
@@ -209,30 +288,18 @@ impl Backend {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<Completion, Failure> {
         let mut stream = Chat::new(&self.client)
-            .create_stream(request)
+            .create_stream_byot::<_, StreamChunk>(request)
             .await
             .map_err(|error| self.classify(error))?;
-        let mut completion = Completion {
-            content: String::new(),
-            stopped: false,
-            usage: None,
-        };
+        let mut completion = Completion::empty();
         while let Some(chunk) = stream.next().await {
             // 2xx 之后的流错误（error 帧、断连、帧解码失败）一律可重试
             // `backend error`（§7.5）。
             let chunk = chunk.map_err(|error| self.classify(error))?;
-            if let Some(usage) = chunk.usage {
-                completion.usage = Some(Usage::from_completion(usage));
+            if chunk.error.is_some() {
+                return Err(Failure::new(Reason::BackendError, true));
             }
-            for choice in chunk.choices {
-                if let Some(reason) = choice.finish_reason {
-                    completion.stopped = reason == FinishReason::Stop;
-                }
-                if let Some(text) = choice.delta.content {
-                    completion.content.push_str(&text);
-                    on_delta(&text);
-                }
-            }
+            completion.fold(chunk, on_delta);
         }
         Ok(completion)
     }
@@ -305,7 +372,6 @@ fn http_diagnostic(status: reqwest::StatusCode, error: &async_openai::error::Api
     }
     line
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -444,9 +510,10 @@ mod tests {
             assert_eq!(
                 completion.usage,
                 Some(Usage {
-                    prompt_tokens: 130,
-                    completion_tokens: 9,
+                    prompt_tokens: Some(130),
+                    completion_tokens: Some(9),
                     cached_tokens: Some(64),
+                    cache_write_tokens: None,
                 })
             );
             // 增量随帧到达调用方（DeepSeek 挂在内容块、OpenRouter 总附带都覆盖）。
@@ -479,9 +546,49 @@ mod tests {
             let endpoint = sse_endpoint(error_frame).await;
             let backend = local_backend(&endpoint);
             let failure = backend.post("sys", "user", &mut |_| {}).await.unwrap_err();
-            // 中途 error 帧表现为 JSONDeserialize：2xx 之后一律可重试 backend error。
+            // 中途 error 帧由自有响应类型显式识别：2xx 之后一律可重试 backend error。
             assert_eq!(failure.reason, Reason::BackendError);
             assert!(failure.retryable);
+        });
+    }
+
+    #[test]
+    fn 并列choice只取第一个() {
+        // §7.3：只累积 choices[0]；其余 choice 的内容与 finish_reason 一律忽略。
+        let frame = concat!(
+            r#"{"choices":[{"index":0,"delta":{"content":"甲"},"finish_reason":"stop"},"#,
+            r#"{"index":1,"delta":{"content":"乙"},"finish_reason":"length"}]}"#
+        );
+        let chunk: StreamChunk = serde_json::from_str(frame).unwrap();
+        let mut completion = Completion::empty();
+        completion.fold(chunk, &mut |_| {});
+        assert_eq!(completion.content, "甲");
+        assert!(completion.stopped);
+    }
+
+    #[test]
+    fn usage缺字段按未知解析不回退() {
+        // §8.3：字段缺失即未知，不按 0 补；缺字段的 usage 不让整块回退。
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}{}data: [DONE]\n\n",
+            chunk_frame("ok", None, r#"{"prompt_tokens":100,"total_tokens":100}"#),
+            chunk_frame("", Some("stop"), ""),
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let endpoint = sse_endpoint(body).await;
+            let backend = local_backend(&endpoint);
+            let completion = backend.post("sys", "user", &mut |_| {}).await.unwrap();
+            assert_eq!(completion.content, "ok");
+            assert!(completion.stopped);
+            assert_eq!(
+                completion.usage,
+                Some(Usage {
+                    prompt_tokens: Some(100),
+                    completion_tokens: None,
+                    cached_tokens: None,
+                    cache_write_tokens: None,
+                })
+            );
         });
     }
 }

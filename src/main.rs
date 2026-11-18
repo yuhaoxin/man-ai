@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::process::exit;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use man_ai::backend::Backend;
 use man_ai::cache::{self, Cache};
@@ -183,10 +184,12 @@ fn translate_to_reader(
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("man-ai: terminal unavailable ({error}); showing the original");
-            write_original(input);
+            write_preconverted(input);
             return 0;
         }
     };
+    // §8.3：整页流逝时间从阅读器接管终端起算。
+    let start = Instant::now();
     let (sender, receiver) = mpsc::channel();
     let (cancel_trigger, cancel) = signals::cancel_pair();
     let mut out = output::Out::channel(sender, cancel);
@@ -202,7 +205,7 @@ fn translate_to_reader(
             let _ = out.finish();
         }
     });
-    let exit = reader::serve_translating(&mut guard, receiver, cancel_trigger);
+    let exit = reader::serve_translating(&mut guard, receiver, cancel_trigger, start);
     for line in &exit.diagnostics {
         eprintln!("man-ai: {line}");
     }
@@ -245,7 +248,7 @@ fn output_original(input: &[u8]) -> i32 {
         }
         Err(error) => {
             eprintln!("man-ai: terminal unavailable ({error}); showing the original");
-            write_original(input);
+            write_preconverted(input);
             0
         }
     }
@@ -255,4 +258,9 @@ fn write_original(input: &[u8]) {
     let mut stdout = io::stdout().lock();
     let _ = stdout.write_all(input);
     let _ = stdout.flush();
+}
+
+/// §5.4 阅读器初始化失败：预转换原文直写 stdout，不带原始 SGR 与退格字节。
+fn write_preconverted(input: &[u8]) {
+    write_original(blocks::preconvert(input).as_bytes());
 }

@@ -8,8 +8,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    FakeModel, Reply, TempDir, chunk, compact, completion, model_config_with, plain,
-    run_reader_driven, run_reader_signaled, run_reader_tty, wait_seen,
+    FakeModel, Reply, TempDir, chunk, compact, completion, model_config_with, run_reader_driven,
+    run_reader_signaled, run_reader_tty, wait_seen,
 };
 use serde_json::json;
 
@@ -221,7 +221,7 @@ fn 初始化失败_警告并直写预转换原文() {
     let run = run_reader_tty(
         &dir,
         &["--lang", LANG],
-        b"a\n\nb\n",
+        b"\x1b[1mls\x1b[0m - list\n\nplain\n",
         &[("TERM", String::new())],
         "",
         &["q"],
@@ -236,9 +236,9 @@ fn 初始化失败_警告并直写预转换原文() {
     // 跳过翻译：预转换原文直写 stdout，不进备用屏幕。
     let raw = String::from_utf8_lossy(&run.raw);
     assert!(!raw.contains(ENTER_ALT), "不应接管终端");
-    let text = compact(&plain(&run.raw));
-    assert!(text.contains("a"), "{text}");
-    assert!(text.contains("b"), "{text}");
+    assert!(!raw.contains('\x1b'), "SGR 不应原始直写: {raw}");
+    assert!(raw.contains("**ls** - list"), "预转换后的强调标记: {raw}");
+    assert!(raw.contains("plain"), "{raw}");
     assert_eq!(model.count(), 0, "初始化失败不应发请求");
 }
 

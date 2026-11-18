@@ -1364,6 +1364,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "reqwest",
+ "serde",
  "serde_json",
  "signal-hook 0.4.6",
  "tempfile",

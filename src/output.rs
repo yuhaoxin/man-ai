@@ -5,10 +5,9 @@
 
 use std::io::{self, Write};
 use std::sync::mpsc;
-use std::time::Duration;
 
-use crate::backend::Usage;
 use crate::blocks::Block;
+use crate::metrics::Measurement;
 use crate::signals::{self, CancelWatch};
 use crate::translate::Outcome;
 
@@ -55,8 +54,10 @@ pub enum Message {
     Live { gap: usize, text: String },
     /// 状态行注记（§8.5）：`retrying` 或 `fallback: <reason>`。
     Note(String),
-    /// 被采用请求的 usage 与生成窗口（§8.3）；usage 缺失即 `None`。
-    Metric { usage: Option<Usage>, window: Duration },
+    /// 被采用请求的测量记录（§8.3）。
+    Metric(Measurement),
+    /// 全部块处置完成（§8.3）：冻结整页流逝时间。
+    Settled,
     /// 整页缓存命中（§8.3）：状态行只显示 elapsed 与 cache hit。
     CacheHit,
     Diagnostic(String),
@@ -113,9 +114,7 @@ impl Out {
     /// 页首行；非 TTY 不写。
     pub fn write_header(&mut self, language: &str) -> io::Result<()> {
         self.language = language.to_string();
-        if matches!(self.sink, Sink::Channel(_)) {
-            self.send(Message::Header(header_text(language)));
-        }
+        self.send(Message::Header(header_text(language)));
         Ok(())
     }
 
@@ -142,13 +141,9 @@ impl Out {
 
     /// 尾行；非 TTY 不写。
     pub fn write_tail(&mut self, outcome: &Outcome) -> io::Result<()> {
-        if !matches!(self.sink, Sink::Channel(_)) {
-            return Ok(());
+        if let Some(text) = tail_text(&self.language, outcome) {
+            self.send(Message::Tail(text));
         }
-        let Some(text) = tail_text(&self.language, outcome) else {
-            return Ok(());
-        };
-        self.send(Message::Tail(text));
         Ok(())
     }
 
@@ -174,37 +169,34 @@ impl Out {
 
     /// 直播块的当前累积文本；非 TTY 不写（增量只进阅读器，§5.3）。
     pub fn write_live(&mut self, gap: usize, text: &str) -> io::Result<()> {
-        if matches!(self.sink, Sink::Channel(_)) {
-            self.send(Message::Live {
-                gap,
-                text: text.to_string(),
-            });
-        }
+        self.send(Message::Live {
+            gap,
+            text: text.to_string(),
+        });
         Ok(())
     }
 
     /// 状态行注记；非 TTY 不写。
     pub fn note(&mut self, text: &str) {
-        if matches!(self.sink, Sink::Channel(_)) {
-            self.send(Message::Note(text.to_string()));
-        }
+        self.send(Message::Note(text.to_string()));
     }
 
-    /// 被采用请求的 usage 与生成窗口（§8.3）；非 TTY 不写。
-    pub fn metric(&mut self, usage: Option<Usage>, window: Duration) {
-        if matches!(self.sink, Sink::Channel(_)) {
-            self.send(Message::Metric { usage, window });
-        }
+    /// 被采用请求的测量记录（§8.3）；非 TTY 不写。
+    pub fn metric(&mut self, measurement: Measurement) {
+        self.send(Message::Metric(measurement));
+    }
+
+    /// 全部块处置完成（§8.3）：阅读器冻结整页流逝时间，不含缓存写入与尾行写出。
+    pub fn settled(&mut self) {
+        self.send(Message::Settled);
     }
 
     /// 整页缓存命中（§8.3）；非 TTY 不写。
     pub fn cache_hit(&mut self) {
-        if matches!(self.sink, Sink::Channel(_)) {
-            self.send(Message::CacheHit);
-        }
+        self.send(Message::CacheHit);
     }
 
-    /// 发送并跟踪写端：阅读器退出后发送失败即视为 EPIPE。
+    /// 发送并跟踪写端：Stdout 汇不产生内容消息，直接丢弃；阅读器退出后发送失败即视为 EPIPE。
     fn send(&mut self, message: Message) {
         let failed = match &self.sink {
             Sink::Stdout => return,
@@ -220,6 +212,7 @@ impl Out {
 mod tests {
     use super::*;
     use crate::backend::Reason;
+    use std::time::Duration;
 
     fn outcome(adopted: usize, total: usize, reason: Option<Reason>) -> Outcome {
         Outcome {
@@ -315,15 +308,18 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let (_trigger, cancel) = crate::signals::cancel_pair();
         let mut out = Out::channel(sender, cancel);
-        out.metric(None, Duration::from_secs(1));
+        out.metric(Measurement {
+            usage: None,
+            window: Duration::from_secs(1),
+        });
         out.cache_hit();
         assert_eq!(
             receiver.try_iter().collect::<Vec<Message>>(),
             vec![
-                Message::Metric {
+                Message::Metric(Measurement {
                     usage: None,
-                    window: Duration::from_secs(1)
-                },
+                    window: Duration::from_secs(1),
+                }),
                 Message::CacheHit,
             ]
         );

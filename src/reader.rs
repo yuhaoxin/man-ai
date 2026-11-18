@@ -274,12 +274,14 @@ impl Parser {
 }
 
 /// 翻译路径：阅读器接管终端后，翻译线程把内容消息发进来。
+/// `start` 是接管时刻：整页流逝时间从它起算（§8.3）。
 pub fn serve_translating(
     guard: &mut TermGuard,
     messages: Receiver<Message>,
     cancel: CancelTrigger,
+    start: Instant,
 ) -> ReaderExit {
-    let mut view = View::new(Instant::now());
+    let mut view = View::new(start);
     serve(&mut view, Some((messages, cancel)), &mut guard.input);
     finish(view)
 }
@@ -470,8 +472,10 @@ impl View {
                 self.lines.extend(rendered);
             }
             Message::Note(text) => self.note = Some(text),
-            Message::Metric { usage, window } => self.metrics.record(usage, window),
+            Message::Metric(measurement) => self.metrics.record(measurement),
             Message::CacheHit => self.metrics.cache_hit = true,
+            // 全部块处置完成：冻结整页流逝时间（§8.3），Done 之前到达。
+            Message::Settled => self.done_at = Some(Instant::now()),
             Message::Diagnostic(line) => self.diagnostics.push(line),
             Message::Tail(text) => {
                 self.lines.push(Line::from(""));
@@ -479,7 +483,6 @@ impl View {
             }
             Message::Done => {
                 self.done = true;
-                self.done_at = Some(Instant::now());
                 self.translating = false;
             }
         }
@@ -703,6 +706,7 @@ impl View {
 mod tests {
     use super::*;
     use crate::backend::Usage;
+    use crate::metrics::Measurement;
     use ratatui::backend::TestBackend;
 
     /// 解析结果：消化字节块后收到的事件。
@@ -884,17 +888,34 @@ mod tests {
         assert!(streaming[7].contains("out 0"), "{}", streaming[7]);
 
         // 被采用请求的 usage 到达：out 跳增、TPS 同时重算（§8.3）。
-        view.update(Message::Metric {
+        view.update(Message::Metric(Measurement {
             usage: Some(Usage {
-                prompt_tokens: 120,
-                completion_tokens: 7,
+                prompt_tokens: Some(120),
+                completion_tokens: Some(7),
                 cached_tokens: Some(64),
+                cache_write_tokens: None,
             }),
             window: Duration::from_secs(1),
-        });
+        }));
         let jumped = render(&mut view, 60, 8);
         assert!(jumped[7].contains("out 7"), "{}", jumped[7]);
         assert!(jumped[7].contains("tps 7"), "{}", jumped[7]);
+    }
+
+    #[test]
+    fn settled冻结整页流逝时间_done不再改点() {
+        let mut view = translating_view();
+        let before = view.elapsed();
+        std::thread::sleep(Duration::from_millis(15));
+        // 全部块处置完成（§8.3）：done_at 定格，缓存写入与尾行写出不再计时。
+        view.update(Message::Settled);
+        let frozen = view.elapsed();
+        assert!(frozen > before, "settled 应已推进并定格");
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(view.elapsed(), frozen, "settled 之后 elapsed 不再增长");
+        // Done 只结束直播，不改动定格值。
+        view.update(Message::Done);
+        assert_eq!(view.elapsed(), frozen);
     }
 
     #[test]
