@@ -14,7 +14,6 @@ use crate::language::Language;
 use crate::pager;
 use crate::prompt;
 use crate::translate;
-use crate::validate;
 
 /// 拦截入口：捕获 man 结果、翻译描述列，再按 stdout 是否 TTY 交付。
 ///
@@ -182,7 +181,7 @@ async fn request(
     loop {
         match backend.post(&system, user).await {
             Ok(completion) => {
-                let text = validate::postprocess(&completion.content);
+                let text = translate::postprocess(&completion.content);
                 if !completion.truncated {
                     if let Some(values) = parse_batch(&text, expected) {
                         return Ok((text, values));

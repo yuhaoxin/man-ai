@@ -126,28 +126,34 @@ fn 空_stdin_与只有空行不发请求也没有页首尾行() {
 }
 
 #[test]
-fn 非_utf8_块不送模型且原样输出() {
-    let model = FakeModel::start(vec![Reply::Ok(completion("译\n", "stop"))]);
+fn 非_utf8_块有损解码后照常翻译() {
+    let model = FakeModel::start(vec![
+        Reply::Ok(completion("甲\n", "stop")),
+        Reply::Ok(completion("乙\n", "stop")),
+    ]);
     let dir = TempDir::new("tty-non-utf8");
     dir.write_config(&model_config(&model, ""));
     let run = run_pager_tty(&dir, &["--lang", LANG], b"ok\n\n\xff\xfe\n", &[]);
-    assert_eq!(model.count(), 1);
-    let mut expected = Vec::new();
-    expected.extend_from_slice(HEADER.as_bytes());
-    expected.extend_from_slice("译\n".as_bytes());
-    expected.extend_from_slice(b"\n\xff\xfe\n\n");
-    expected.extend_from_slice("── man-ai: translated (Simplified Chinese) ──\n".as_bytes());
-    assert_eq!(run.output, expected);
+    assert_eq!(model.count(), 2);
+    // 第二块按 U+FFFD 有损解码后送模型，也计入采用。
+    let requests = model.requests();
+    assert_eq!(requests[1].body["messages"][1]["content"], "\u{fffd}\u{fffd}\n");
+    assert_eq!(
+        text(&run.output),
+        format!(
+            "{HEADER}甲\n\n乙\n\n── man-ai: translated (Simplified Chinese) ──\n"
+        )
+    );
 }
 
 #[test]
-fn 结构非法时回退该块且不半截写入() {
+fn 空白响应重试一次后回退该块且不半截写入() {
     let model = FakeModel::start(vec![
         Reply::Ok(completion("甲\n", "stop")),
-        Reply::Ok(completion("\x08bad", "stop")),
-        Reply::Ok(completion("\x08bad", "stop")),
+        Reply::Ok(completion("   \n", "stop")),
+        Reply::Ok(completion("   \n", "stop")),
     ]);
-    let dir = TempDir::new("tty-invalid");
+    let dir = TempDir::new("tty-blank");
     dir.write_config(&model_config(&model, ""));
     let run = run_pager_tty(&dir, &["--lang", LANG], b"a\n\nb\n", &[]);
     assert_eq!(
@@ -160,68 +166,17 @@ fn 结构非法时回退该块且不半截写入() {
 }
 
 #[test]
-fn 字面转义与非法_sgr_也回退() {
-    for (tag, bad) in [
-        ("literal", "text ESC[1m more"),
-        ("sgr", "\x1b[1mnever closed"),
-    ] {
-        let model = FakeModel::start(vec![
-            Reply::Ok(completion(bad, "stop")),
-            Reply::Ok(completion(bad, "stop")),
-        ]);
-        let dir = TempDir::new(tag);
-        dir.write_config(&model_config(&model, ""));
-        let run = run_pager_tty(&dir, &["--lang", LANG], b"block\n", &[]);
-        assert_eq!(
-            text(&run.output),
-            format!(
-                "{HEADER}block\n\n── man-ai: partially translated (0/1 blocks, backend error) ──\n"
-            ),
-            "{tag}"
-        );
-        assert_eq!(model.count(), 2, "{tag}");
-    }
-}
-
-#[test]
-fn 样式丢失重试一次后接受() {
-    let model = FakeModel::start(vec![
-        Reply::Ok(completion("没有样式\n", "stop")),
-        Reply::Ok(completion("有样式\n", "stop")),
-    ]);
-    let dir = TempDir::new("style-lost");
+fn 畸形但_2xx_的响应照常采用() {
+    // §7.4：不做内容检查，控制字符不构成失败；已知风险，渲染侧统一处理。
+    let bad = "\x1b[1m字面 ESC[1m 与退格 \x08\n";
+    let model = FakeModel::start(vec![Reply::Ok(completion(bad, "stop"))]);
+    let dir = TempDir::new("tty-malformed-2xx");
     dir.write_config(&model_config(&model, ""));
-    let run = run_pager_tty(
-        &dir,
-        &["--lang", LANG],
-        "\x1b[1mbold\x1b[0m\n".as_bytes(),
-        &[],
-    );
-    assert_eq!(model.count(), 2);
+    let run = run_pager_tty(&dir, &["--lang", LANG], b"block\n", &[]);
+    assert_eq!(model.count(), 1);
     assert_eq!(
         text(&run.output),
-        format!("{HEADER}有样式\n\n── man-ai: translated (Simplified Chinese) ──\n")
-    );
-}
-
-#[test]
-fn 样式重试后仍缺失也接受() {
-    let model = FakeModel::start(vec![
-        Reply::Ok(completion("一\n", "stop")),
-        Reply::Ok(completion("二\n", "stop")),
-    ]);
-    let dir = TempDir::new("style-lost-accept");
-    dir.write_config(&model_config(&model, ""));
-    let run = run_pager_tty(
-        &dir,
-        &["--lang", LANG],
-        "\x1b[1mbold\x1b[0m\n".as_bytes(),
-        &[],
-    );
-    assert_eq!(model.count(), 2);
-    assert_eq!(
-        text(&run.output),
-        format!("{HEADER}二\n\n── man-ai: translated (Simplified Chinese) ──\n")
+        format!("{HEADER}{bad}\n── man-ai: translated (Simplified Chinese) ──\n")
     );
 }
 
