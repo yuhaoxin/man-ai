@@ -73,17 +73,17 @@ fn 失败的回退不入缓存() {
 }
 
 #[test]
-fn 非_utf8_块不发请求也不入缓存() {
+fn 非_utf8_块有损解码后照常请求并落缓存() {
     let dir = TempDir::new("t22-binary");
-    let model = FakeModel::start(Vec::new());
+    let model = FakeModel::start(vec![Reply::Ok(completion("译\n", "stop"))]);
     dir.write_config(&model_config(&model, ""));
     let env = cache_env(&dir);
     let env = env_refs(&env);
 
     let run = run_pipe(&dir, &["--translate", "--lang", LANG], b"\xff\xfe\n", &env);
-    assert_eq!(model.count(), 0);
-    assert_eq!(run.stdout, b"\xff\xfe\n");
-    assert_eq!(entries(&dir), 0);
+    assert_eq!(model.count(), 1);
+    assert_eq!(run.stdout, "译\n".as_bytes());
+    assert_eq!(entries(&dir), 1);
 }
 
 #[test]

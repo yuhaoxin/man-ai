@@ -1,7 +1,7 @@
-//! 翻译管线：按块序并发请求、重试状态机、回退（规格 §7.7、§8.1、§8.5）。
+//! 翻译管线：按块序并发请求、重试状态机、回退（规格 §7、§8）。
 //!
 //! `buffered(concurrency)` 给出在途上限并保持产出顺序；重试在同一个槽位内完成。
-//! 写出顺序恒等块序：已完成的后续块留在内存等前序。
+//! 写出顺序恒等块序：已完成的后续块留在内存等前序。回退与未完成块写预转换原文。
 
 use std::future::Future;
 use std::io;
@@ -16,7 +16,7 @@ use crate::blocks::{Block, SplitPage};
 use crate::cache::{Cache, Form, KeyParts};
 use crate::language::Language;
 use crate::output::Out;
-use crate::{prompt, validate};
+use crate::prompt;
 
 /// 重试前的固定等待（§7.7）。
 pub const RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -92,15 +92,11 @@ impl BlockResult {
 
 /// 按块序并发翻译整页并流式写出。
 ///
-/// 非 UTF-8 块不送模型、原样输出，也不计入 `total`/`adopted`。
+/// 每块送预转换文本，失败块写预转换原文（§6.3）。
 pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> io::Result<Outcome> {
     out.write_header(ctx.lang.display())?;
     let system = prompt::page(ctx.lang);
-    let total = page
-        .blocks
-        .iter()
-        .filter(|block| block.text.is_some())
-        .count();
+    let total = page.blocks.len();
     let stop = AtomicBool::new(false);
     let interrupt = out.interrupt_flag().unwrap_or_default();
     let mut adopted = 0;
@@ -124,10 +120,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let stop_ref = &stop;
     let interrupt_ref = &interrupt;
     let results = stream::iter(page.blocks)
-        .map(move |mut block| async move {
-            let Some(text) = block.text.take() else {
-                return BlockResult::original(block);
-            };
+        .map(move |block| async move {
             /* 确定性失败或第一次 Ctrl-C 之后，未开始的块不再发请求。 */
             if stop_ref.load(Ordering::Relaxed) || interrupt_ref.load(Ordering::Relaxed) {
                 return BlockResult::original(block);
@@ -149,7 +142,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                     };
                 }
             }
-            match translate_block(backend, system, &text, stop_ref, interrupt_ref).await {
+            match translate_block(backend, system, &block.pre, stop_ref, interrupt_ref).await {
                 Ok(translation) => {
                     /* 采用后立即写，与写出顺序无关（§9.3）。 */
                     if let Some(parts) = parts {
@@ -197,7 +190,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         }
         let body = match &result.translation {
             Some(translation) => translation.as_bytes(),
-            None => &result.block.raw,
+            None => result.block.pre.as_bytes(),
         };
         out.write_block(&result.block, body)?;
         if let Some(line) = ctx.cache.take_warning() {
@@ -246,8 +239,6 @@ fn most_common(reasons: &[Reason]) -> Option<Reason> {
 
 enum Verdict {
     Accepted(String),
-    /// 输入有样式、输出一条不剩：先重试一次，仍没有就接受。
-    StyleLost(String),
     Rejected,
 }
 
@@ -267,7 +258,7 @@ async fn translate_block(
             return Err(Failure::new(Reason::Interrupted, false));
         }
         let verdict = match post(backend, system, input, interrupt).await {
-            Ok(completion) => evaluate(input, &completion),
+            Ok(completion) => evaluate(&completion),
             Err(failure) => {
                 if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
                     retried = true;
@@ -280,11 +271,6 @@ async fn translate_block(
         let stopped = stop.load(Ordering::Relaxed);
         match verdict {
             Verdict::Accepted(text) => return Ok(text),
-            Verdict::StyleLost(text) if stopped || retried => return Ok(text),
-            Verdict::StyleLost(_) => {
-                retried = true;
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
             Verdict::Rejected if stopped || retried => {
                 return Err(Failure::new(Reason::BackendError, true));
             }
@@ -317,17 +303,54 @@ async fn post(
     }
 }
 
-/// §7.4 加工 + §7.5 校验。
-fn evaluate(input: &str, completion: &Completion) -> Verdict {
+/// §7.3 返回加工：剥掉首尾纯空行；行内与行尾空格保留（可能是排版）。
+fn postprocess(raw: &str) -> String {
+    strip_blank_edges(raw)
+}
+
+/// 剥掉首尾只含空白的行；中间的行原样保留。
+fn strip_blank_edges(text: &str) -> String {
+    let lines = lines_with_endings(text);
+    let Some(first) = lines.iter().position(|line| !is_blank_line(content(line))) else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !is_blank_line(content(line)))
+        .unwrap_or(first);
+    lines[first..=last].concat()
+}
+
+/// 按 `\n` 切行，除最后一行外都带换行符。
+fn lines_with_endings(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while let Some(offset) = rest.find('\n') {
+        lines.push(&rest[..=offset]);
+        rest = &rest[offset + 1..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
+fn content(line: &str) -> &str {
+    line.strip_suffix('\n').unwrap_or(line)
+}
+
+fn is_blank_line(text: &str) -> bool {
+    text.chars().all(|c| matches!(c, ' ' | '\t' | '\r'))
+}
+
+/// §7.4 采用判定：2xx + 未被 length 截断 + 非空白；合法 UTF-8 由 JSON 反序列化保证。
+fn evaluate(completion: &Completion) -> Verdict {
     if completion.truncated {
         return Verdict::Rejected;
     }
-    let text = validate::postprocess(&completion.content);
-    if text.trim().is_empty() || validate::structural(&text).is_err() {
+    let text = postprocess(&completion.content);
+    if text.trim().is_empty() {
         return Verdict::Rejected;
-    }
-    if validate::has_styles(input) && !validate::has_styles(&text) {
-        return Verdict::StyleLost(text);
     }
     Verdict::Accepted(text)
 }
@@ -374,35 +397,33 @@ mod tests {
     }
 
     #[test]
-    fn 校验拒绝空响应与截断() {
+    fn 采用判定拒绝空白与截断() {
         assert!(matches!(
-            evaluate("x", &completion("   \n", Some("stop"))),
+            evaluate(&completion("   \n", Some("stop"))),
             Verdict::Rejected
         ));
         assert!(matches!(
-            evaluate("x", &completion("ok", Some("length"))),
+            evaluate(&completion("ok", Some("length"))),
             Verdict::Rejected
         ));
         assert!(matches!(
-            evaluate("x", &completion("\x08bad", Some("stop"))),
-            Verdict::Rejected
+            evaluate(&completion("纯文本", Some("stop"))),
+            Verdict::Accepted(_)
+        ));
+        // §7.4：不做内容检查，带控制字符的 2xx 响应照常采用。
+        assert!(matches!(
+            evaluate(&completion("\x08bad", Some("stop"))),
+            Verdict::Accepted(text) if text == "\x08bad"
         ));
     }
 
     #[test]
-    fn 样式丢失先标为重试() {
-        let input = "\x1b[1mbold\x1b[0m";
-        assert!(matches!(
-            evaluate(input, &completion("粗体", Some("stop"))),
-            Verdict::StyleLost(_)
-        ));
-        assert!(matches!(
-            evaluate(input, &completion("\x1b[1m粗体\x1b[0m", Some("stop"))),
-            Verdict::Accepted(_)
-        ));
-        assert!(matches!(
-            evaluate("plain", &completion("纯文本", Some("stop"))),
-            Verdict::Accepted(_)
-        ));
+    fn 返回加工只剥首尾纯空行() {
+        assert_eq!(postprocess("\n\n  x  \n\n"), "  x  \n");
+        // 行内与行尾空格保留；中间空行保留；整块空白归零。
+        assert_eq!(postprocess("a\n\n \nb \n"), "a\n\n \nb \n");
+        assert_eq!(postprocess("  \t\r\n"), "");
+        // 恰好是整块围栏时按字面保留，不剥围栏（§7.3）。
+        assert_eq!(postprocess("```\nls -l\n```\n"), "```\nls -l\n```\n");
     }
 }

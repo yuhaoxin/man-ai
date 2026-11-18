@@ -34,6 +34,10 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 翻译失败的用户可见分类，固定五项：`not configured`、`model unreachable`、`timeout`、`backend error`、`interrupted`。
 
+## 预转换（pre-conversion）
+
+切块后对块内渲染字节做的确定性转换：SGR 粗体/下划线与退格叠加转成 `**…**`/`*…*`，其余控制序列剥除，非 UTF-8 字节按 U+FFFD 有损解码。产物 `pre` 是送模型的唯一内容，也是回退输出；原始渲染字节不送模型、不写入输出。
+
 ## 确定性失败（deterministic failure）
 
 重试不会改变结果的失败：未配置、确定性 4xx（429 以外的 4xx）、重试一次后仍不可达的端点。发生后停止提交新块。
@@ -52,7 +56,7 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 采用 / 回退（adopted / fallback）
 
-采用指该块的译文或缓存命中被写出；回退指该块写出原文。尾行按块统计两者。
+采用指该块的译文或缓存命中被写出；回退指该块写出预转换原文。尾行按块统计两者。
 
 ## 替换方式（replacement method）
 
