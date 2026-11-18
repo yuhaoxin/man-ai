@@ -87,7 +87,7 @@ fn 非_utf8_块有损解码后照常请求并落缓存() {
 }
 
 #[test]
-fn 命中不改首屏与顺序() {
+fn 命中零请求且阅读器输出一致() {
     let dir = TempDir::new("t22-order");
     let model = FakeModel::start(vec![
         Reply::Ok(completion("t1\n", "stop")),
@@ -95,15 +95,31 @@ fn 命中不改首屏与顺序() {
     ]);
     dir.write_config(&model_config_with(&model, 2, ""));
     let env = cache_env(&dir);
-    let env = env_refs(&env);
     let input = b"a\n\nb\n";
 
-    let first = run_pager_tty(&dir, &["--lang", LANG], input, &env);
+    let run = |dir: &TempDir| {
+        common::run_reader_tty(
+            dir,
+            &["--lang", LANG],
+            input,
+            &env,
+            "── man-ai: translated (Simplified Chinese) ──",
+            &["q"],
+        )
+    };
+    let first = run(&dir);
     assert_eq!(model.count(), 2);
-    let second = run_pager_tty(&dir, &["--lang", LANG], input, &env);
+    let second = run(&dir);
     assert_eq!(model.count(), 2, "命中不应再发请求");
-    assert_eq!(second.output, first.output);
-    assert!(text(&second.output).contains("── man-ai: translation"));
+    // 阅读器输出含页首行与尾行；elapsed 各不相同，不比较时间行。
+    for text in [first.text(), second.text()] {
+        assert!(text.contains("── man-ai: translation (Simplified Chinese) ──"));
+        assert!(text.contains("── man-ai: translated (Simplified Chinese) ──"));
+        assert!(text.contains("t1"));
+        assert!(text.contains("t2"));
+    }
+    assert_eq!(first.code, 0);
+    assert_eq!(second.code, 0);
 }
 
 #[test]

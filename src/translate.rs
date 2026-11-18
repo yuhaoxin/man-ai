@@ -17,12 +17,10 @@ use crate::cache::{Cache, Form, KeyParts};
 use crate::language::Language;
 use crate::output::Out;
 use crate::prompt;
+use crate::signals::CancelWatch;
 
 /// 重试前的固定等待（§7.7）。
 pub const RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// 轮询第一次 Ctrl-C 的间隔（§5.6）；在途请求据此丢弃。
-const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 /// 一次翻译运行需要的上下文。
 #[derive(Clone, Copy)]
@@ -60,6 +58,7 @@ impl Outcome {
 
 /// 在独立运行时上跑完一页。
 pub fn block_on<F: Future>(future: F) -> F::Output {
+    eprintln!("[dbg] block_on enter");
     tokio::runtime::Runtime::new()
         .expect("tokio runtime")
         .block_on(future)
@@ -94,11 +93,14 @@ impl BlockResult {
 ///
 /// 每块送预转换文本，失败块写预转换原文（§6.3）。
 pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> io::Result<Outcome> {
+    eprintln!("[dbg] run_page start");
     out.write_header(ctx.lang.display())?;
+    eprintln!("[dbg] header sent");
     let system = prompt::page(ctx.lang);
     let total = page.blocks.len();
     let stop = AtomicBool::new(false);
-    let interrupt = out.interrupt_flag().unwrap_or_default();
+    let cancel = out.cancel();
+    let cancel_after = cancel.clone();
     let mut adopted = 0;
     let mut failures: Vec<Reason> = Vec::new();
     let mut diagnosed = false;
@@ -118,11 +120,12 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     });
     let system = system.as_str();
     let stop_ref = &stop;
-    let interrupt_ref = &interrupt;
     let results = stream::iter(page.blocks)
-        .map(move |block| async move {
-            /* 确定性失败或第一次 Ctrl-C 之后，未开始的块不再发请求。 */
-            if stop_ref.load(Ordering::Relaxed) || interrupt_ref.load(Ordering::Relaxed) {
+        .map(move |block| {
+            let cancel = cancel.clone();
+            async move {
+            /* 确定性失败或翻译期间的 Ctrl-C 之后，未开始的块不再发请求。 */
+            if stop_ref.load(Ordering::Relaxed) || cancel.triggered() {
                 return BlockResult::original(block);
             }
             let Some(backend) = backend else {
@@ -142,7 +145,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                     };
                 }
             }
-            match translate_block(backend, system, &block.pre, stop_ref, interrupt_ref).await {
+            match translate_block(backend, system, &block.pre, stop_ref, &cancel).await {
                 Ok(translation) => {
                     /* 采用后立即写，与写出顺序无关（§9.3）。 */
                     if let Some(parts) = parts {
@@ -162,6 +165,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                     BlockResult::failed(block, failure)
                 }
             }
+        }
         })
         .buffered(ctx.concurrency);
     futures::pin_mut!(results);
@@ -189,20 +193,20 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
             adopted += 1;
         }
         let body = match &result.translation {
-            Some(translation) => translation.as_bytes(),
-            None => result.block.pre.as_bytes(),
+            Some(translation) => translation.as_str(),
+            None => result.block.pre.as_str(),
         };
         out.write_block(&result.block, body)?;
         if let Some(line) = ctx.cache.take_warning() {
             out.diagnostic(&line);
         }
-        /* 分页器提前退出：丢弃在途请求、停止写入（§8.2）。 */
+        /* 阅读器退出（q）：丢弃在途请求、停止写入（§8.5）。 */
         if out.broken() {
             break;
         }
     }
 
-    let interrupted = interrupt.load(Ordering::Relaxed);
+    let interrupted = cancel_after.triggered();
     let outcome = Outcome {
         adopted,
         total,
@@ -244,20 +248,20 @@ enum Verdict {
 
 /// 一块的完整尝试：最多重试一次，重试前等 500ms（§7.7）。
 ///
-/// 确定性失败之后不再发起重试；第一次 Ctrl-C 直接放弃该块。
+/// 确定性失败之后不再发起重试；翻译期间的 Ctrl-C 直接放弃该块。
 async fn translate_block(
     backend: &Backend,
     system: &str,
     input: &str,
     stop: &AtomicBool,
-    interrupt: &AtomicBool,
+    cancel: &CancelWatch,
 ) -> Result<String, Failure> {
     let mut retried = false;
     loop {
-        if interrupt.load(Ordering::Relaxed) {
+        if cancel.triggered() {
             return Err(Failure::new(Reason::Interrupted, false));
         }
-        let verdict = match post(backend, system, input, interrupt).await {
+        let verdict = match post(backend, system, input, cancel.clone()).await {
             Ok(completion) => evaluate(&completion),
             Err(failure) => {
                 if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
@@ -282,24 +286,18 @@ async fn translate_block(
     }
 }
 
-/// 单次请求；第一次 Ctrl-C 时丢弃在途 future，不等它返回（§5.6）。
+/// 单次请求；取消触发时丢弃在途 future，不等它返回（§5.4）。
 async fn post(
     backend: &Backend,
     system: &str,
     input: &str,
-    interrupt: &AtomicBool,
+    mut cancel: CancelWatch,
 ) -> Result<Completion, Failure> {
     let request = backend.post(system, input);
     futures::pin_mut!(request);
-    loop {
-        tokio::select! {
-            result = &mut request => return result,
-            () = tokio::time::sleep(CANCEL_POLL) => {
-                if interrupt.load(Ordering::Relaxed) {
-                    return Err(Failure::new(Reason::Interrupted, false));
-                }
-            }
-        }
+    tokio::select! {
+        result = &mut request => result,
+        () = cancel.cancelled() => Err(Failure::new(Reason::Interrupted, false)),
     }
 }
 

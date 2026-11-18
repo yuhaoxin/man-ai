@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
@@ -337,47 +337,158 @@ fn run_pty_script_with(
     RawPtyRun { output, code }
 }
 
-// ---------------------------------------------------------------- 假分页器
+// ---------------------------------------------------------------- 阅读器 pty
 
-/// 边读边记录的内层分页器：启动时写 `<name>.start` 标记（证明首屏），
-/// 每读到一行同时追加到 `<name>.log` 并回显到 stdout。
-pub fn recording_pager(dir: &TempDir, name: &str) -> PathBuf {
-    let start = dir.file(&format!("{name}.start"));
-    let log = dir.file(&format!("{name}.log"));
-    let path = dir.file(&format!("{name}-pager"));
-    write_script(
-        &path,
-        &format!(
-            "#!/bin/sh\necho started > '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  printf '%s\\n' \"$line\"\ndone\n",
-            start.display(),
-            log.display()
-        ),
-    );
-    path
-}
-
-/// 只读一个字节就退出的分页器：用于 EPIPE（退出码 7）。
-pub fn quitting_pager(dir: &TempDir, name: &str) -> PathBuf {
-    let path = dir.file(&format!("{name}-pager"));
-    write_script(&path, "#!/bin/sh\nhead -c 1 >/dev/null\nexit 7\n");
-    path
-}
-
-/// 记录分页器收到的行（含页首/尾行，pty 的 `\r\n` 已归一）。
-pub fn pager_log(dir: &TempDir, name: &str) -> Vec<String> {
-    fs::read_to_string(dir.file(&format!("{name}.log")))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// 往进程发 SIGINT；`/bin/kill` 在 macOS 与 Linux 都有。
-pub fn send_sigint(pid: u32) -> bool {
+/// 往进程发信号；`/bin/kill` 在 macOS 与 Linux 都有。
+pub fn send_signal(pid: u32, signal: &str) -> bool {
     Command::new("/bin/kill")
-        .args(["-INT", &pid.to_string()])
+        .args([format!("-{signal}"), pid.to_string()])
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// 阅读器在 pty 上的运行结果。
+pub struct ReaderRun {
+    /// pty 原始输出，保留 ANSI 序列。
+    pub raw: Vec<u8>,
+    pub code: i32,
+    pub stderr: String,
+}
+
+impl ReaderRun {
+    /// 去掉 pty 的 `\r` 后的有损解码文本。
+    pub fn text(&self) -> String {
+        let cleaned = strip_carriage_returns(self.raw.clone());
+        String::from_utf8_lossy(&cleaned).into_owned()
+    }
+}
+
+/// 在 pty 下跑分页器模式 + stdout 是 TTY：阅读器接管终端。
+///
+/// 输出出现 `expect` 后把 `keys` 逐个写进 pty（作为按键）。`expect` 为空串时
+/// 等一拍就按（信号与初始化失败类测试用）。
+pub fn run_reader_tty(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, String)],
+    expect: &str,
+    keys: &[&str],
+) -> ReaderRun {
+    let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+    run_reader_driven(dir, args, stdin, extra_env, expect, move |_pid, writer, _seen| {
+        std::thread::sleep(Duration::from_millis(200));
+        for key in &keys {
+            let _ = writer.write_all(key.as_bytes());
+            let _ = writer.flush();
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    })
+}
+
+/// 同上，但触发后给进程发信号而不是按键。
+pub fn run_reader_signaled(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, String)],
+    expect: &str,
+    signal: &str,
+) -> ReaderRun {
+    let signal = signal.to_string();
+    run_reader_driven(dir, args, stdin, extra_env, expect, move |pid, _writer, _seen| {
+        std::thread::sleep(Duration::from_millis(200));
+        send_signal(pid, &signal);
+    })
+}
+
+/// 阅读器交互驱动：输出出现 `expect` 后执行 `action`（按键或发信号），
+/// 然后等进程退出。读 pty 一直在后台线程，`action` 期间输出照常排空；
+/// `seen` 是实时输出的共享句柄，多阶段动作可以轮询它。
+pub fn run_reader_driven<F>(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, String)],
+    expect: &str,
+    action: F,
+) -> ReaderRun
+where
+    F: FnOnce(u32, &mut dyn Write, &Arc<Mutex<Vec<u8>>>) + Send + 'static,
+{
+    let input = dir.file("stdin.bin");
+    fs::write(&input, stdin).unwrap();
+    let stderr_file = dir.file("stderr.txt");
+    let mut script = String::from("exec ");
+    script.push_str(&sh_quote(BIN));
+    for arg in args {
+        script.push(' ');
+        script.push_str(&sh_quote(arg));
+    }
+    script.push_str(&format!(
+        " <{} 2>{}",
+        sh_quote(input.to_str().unwrap()),
+        sh_quote(stderr_file.to_str().unwrap())
+    ));
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.args(["-c", &script]);
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("HOME", dir.path().to_str().unwrap());
+    command.env("XDG_CONFIG_HOME", dir.xdg().to_str().unwrap());
+    command.env("TERM", "xterm-256color");
+    command.env("MANWIDTH", "80");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let pid = child.process_id().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let pump = std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(size) => sink.lock().unwrap().extend_from_slice(&buffer[..size]),
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let snapshot = loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let snapshot = seen.lock().unwrap().clone();
+        let found = expect.is_empty() || String::from_utf8_lossy(&snapshot).contains(expect);
+        if found {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "60 秒内未见 {expect:?}，已读：{}",
+            String::from_utf8_lossy(&snapshot)
+        );
+    };
+    action(pid, &mut *writer, &seen);
+    let _ = pump.join();
+    let code = child.wait().unwrap().exit_code() as i32;
+    ReaderRun {
+        raw: seen.lock().unwrap().clone(),
+        code,
+        stderr: fs::read_to_string(&stderr_file).unwrap_or_default(),
+    }
 }
 
 // ---------------------------------------------------------------- 假 man

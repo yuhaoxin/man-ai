@@ -5,15 +5,15 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Command, ExitStatus, Stdio};
 
 use crate::backend::Backend;
 use crate::cache;
 use crate::config::Config;
 use crate::language::Language;
 use crate::translate::PipelineCtx;
-use crate::{blocks, cli, config, output, pager, translate};
+use crate::{blocks, cli, config, output, translate};
 
 /// `-P` 让路时写到 stderr 的一行（§4.3）。程序输出一律英文。
 pub const PAGER_OVERRIDE_NOTE: &str = "man-ai: -P overrides MANPAGER; not translating";
@@ -46,7 +46,6 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
             return capture_and_translate(own, &language, &loaded.config);
         }
     }
-    save_manpager();
     set_env("MANPAGER", manpager_value(lang, own.translate));
     exec_man(&own.rest)
 }
@@ -85,7 +84,7 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
         Ok(output) => output,
         Err(_) => return 127,
     };
-    let code = pager::exit_code(output.status);
+    let code = exit_code(output.status);
     if output.stdout.is_empty() {
         return code;
     }
@@ -107,7 +106,7 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
             None
         }
     };
-    let mut out = output::Out::new(false, Vec::new());
+    let mut out = output::Out::stdout();
     let ctx = PipelineCtx {
         lang,
         backend: backend.as_ref(),
@@ -143,20 +142,6 @@ fn manpager_value(lang: Option<&str>, translate: Option<bool>) -> String {
     value
 }
 
-/// 把用户原有的 `MANPAGER` 存进 `MAN_AI_PAGER`；指向自身时不写（§5.1 第 8 条）。
-fn save_manpager() {
-    let Some(original) = env::var_os("MANPAGER") else {
-        return;
-    };
-    if original.is_empty() {
-        return;
-    }
-    if original.to_str().is_some_and(pager::points_to_self) {
-        return;
-    }
-    set_env("MAN_AI_PAGER", original);
-}
-
 fn set_env(key: &str, value: impl Into<OsString>) {
     // SAFETY: 薄壳在 exec man 之前始终单线程，没有并发读取环境。
     unsafe { env::set_var(key, value.into()) };
@@ -167,18 +152,25 @@ fn exec_man(args: &[OsString]) -> i32 {
     127
 }
 
+/// 子进程被信号杀死时为 `128 + 信号编号`（§4.4）。
+fn exit_code(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn manpager_值按规格拼接() {
+    fn manpager_取值按规格_4_2() {
         assert_eq!(manpager_value(None, None), "man-ai");
         assert_eq!(manpager_value(Some("zh-CN"), None), "man-ai --lang zh-CN");
-        assert_eq!(manpager_value(None, Some(true)), "man-ai --translate");
         assert_eq!(
-            manpager_value(Some("ja"), Some(false)),
-            "man-ai --lang ja --no-translate"
+            manpager_value(Some("zh-CN"), Some(false)),
+            "man-ai --lang zh-CN --no-translate"
         );
+        assert_eq!(manpager_value(None, Some(true)), "man-ai --translate");
     }
 }

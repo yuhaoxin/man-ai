@@ -4,18 +4,21 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::exit;
+use std::sync::mpsc;
+use std::thread;
 
 use man_ai::backend::Backend;
 use man_ai::cache::{self, Cache};
 use man_ai::language::Language;
-use man_ai::translate::PipelineCtx;
-use man_ai::{blocks, cli, config, output, pager, shellmode, translate};
+use man_ai::translate::{self, PipelineCtx};
+use man_ai::{blocks, cli, config, output, reader, shellmode, signals};
 
 const HELP: &str = "\
 Usage: man-ai [--lang <tag>] [--translate | --no-translate] [man arguments...]
 
-man-ai wraps man through MANPAGER: pages are rendered by the platform man and
-translated into the language chosen by --lang.
+man-ai wraps man through MANPAGER: pages are rendered by the platform man,
+translated into the language chosen by --lang, and shown in a built-in
+Markdown reader.
 
 Own arguments:
   --help          show this help and exit
@@ -26,7 +29,6 @@ Own arguments:
 
 Environment:
   MANPAGER        the thin shell writes itself here; this is the entry point
-  MAN_AI_PAGER    man-ai saves your original MANPAGER here for the inner pager chain
 
 All other arguments are passed to man unchanged.
 ";
@@ -91,6 +93,16 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
             eprintln!("{warning}");
         }
     }
+    // §4.2：剥离自有参数后残留的 argv 警告一行后继续。
+    if !own.rest.is_empty() {
+        let args = own
+            .rest
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("man-ai: ignoring pager arguments: {args}");
+    }
 
     // §5.2 第 3 条：确定要走翻译路径时，读 stdin 之前剪枝。
     let will_translate = !lang.is_english()
@@ -112,14 +124,14 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
     let _ = io::stdin().read_to_end(&mut input);
     let page = blocks::split(&input);
 
-    // §5.2 第 5 条：en、--no-translate、非 TTY 且没有 --translate、0 块都原文直通。
+    // §5.2 第 6 条：en、--no-translate、非 TTY 且没有 --translate、0 块都原文直通。
     let to_translate = io::stdout().is_terminal() || own.translate == Some(true);
     let translate_page = !lang.is_english()
         && own.translate != Some(false)
         && to_translate
         && !page.blocks.is_empty();
     if !translate_page {
-        return output_original(own, &input);
+        return output_original(&input);
     }
 
     let backend = match Backend::from_config(&loaded.config) {
@@ -131,20 +143,69 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
             None
         }
     };
+    if io::stdout().is_terminal() {
+        translate_to_reader(page, &input, lang, backend, cache, loaded.config.concurrency)
+    } else {
+        let ctx = PipelineCtx {
+            lang: &lang,
+            backend: backend.as_ref(),
+            cache: &cache,
+            concurrency: loaded.config.concurrency,
+        };
+        translate_to_stdout(page, ctx)
+    }
+}
 
-    let tty = io::stdout().is_terminal();
-    let mut out = output::Out::new(tty, own.rest.clone());
-    let ctx = PipelineCtx {
-        lang: &lang,
-        backend: backend.as_ref(),
-        cache: &cache,
-        concurrency: loaded.config.concurrency,
+/// 翻译路径的 TTY 端：阅读器接管终端，翻译线程把块按序发进来（§8.1）。
+///
+/// 翻译线程持有全部所有权的上下文；进程随阅读器退出，在途请求一并丢弃。
+fn translate_to_reader(
+    page: blocks::SplitPage,
+    input: &[u8],
+    lang: Language,
+    backend: Option<Backend>,
+    cache: Cache,
+    concurrency: usize,
+) -> i32 {
+    // 阅读器先接管终端；初始化失败时跳过翻译，预转换原文直写 stdout（§5.4）。
+    let guard = match reader::takeover() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("man-ai: terminal unavailable ({error}); showing the original");
+            write_original(input);
+            return 0;
+        }
     };
+    let (sender, receiver) = mpsc::channel();
+    let (cancel_trigger, cancel) = signals::cancel_pair();
+    let mut out = output::Out::channel(sender, cancel);
+    thread::spawn(move || {
+        eprintln!("[dbg] worker start");
+        let ctx = PipelineCtx {
+            lang: &lang,
+            backend: backend.as_ref(),
+            cache: &cache,
+            concurrency,
+        };
+        if translate::block_on(translate::run_page(page, ctx, &mut out)).is_ok() {
+            let _ = out.finish();
+        }
+    });
+    let exit = reader::serve_translating(guard, receiver, cancel_trigger);
+    for line in &exit.diagnostics {
+        eprintln!("man-ai: {line}");
+    }
+    exit.code
+}
+
+/// 翻译路径的非 TTY 端：译文 Markdown 按序直写 stdout（§5.3）。
+fn translate_to_stdout(page: blocks::SplitPage, ctx: PipelineCtx<'_>) -> i32 {
+    let mut out = output::Out::stdout();
     let outcome = match translate::block_on(translate::run_page(page, ctx, &mut out)) {
         Ok(outcome) => outcome,
         Err(_) => return 0,
     };
-    if !tty && outcome.all_failed() && !out.broken() {
+    if outcome.all_failed() && !out.broken() {
         if let Some(reason) = outcome.reason {
             eprintln!(
                 "man-ai: translation failed ({}), showing the original below",
@@ -155,17 +216,31 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
     out.finish().unwrap_or(0)
 }
 
-/// 原文直通：TTY 走内层分页器链，非 TTY 直写 stdout（§5.2 第 5 条）。
-fn output_original(own: &cli::OwnArgs, input: &[u8]) -> i32 {
-    if io::stdout().is_terminal() {
-        if let Some(chain) = pager::resolve() {
-            if let Ok(code) = pager::pipe(&chain, &own.rest, input) {
-                return code;
+/// 原文直通（§5.2 第 6 条）：TTY 进阅读器显示预转换原文，非 TTY 直写 stdout。
+fn output_original(input: &[u8]) -> i32 {
+    if !io::stdout().is_terminal() {
+        write_original(input);
+        return 0;
+    }
+    let original = blocks::preconvert(input);
+    match reader::takeover() {
+        Ok(guard) => {
+            let exit = reader::serve_static(guard, original);
+            for line in &exit.diagnostics {
+                eprintln!("man-ai: {line}");
             }
+            exit.code
+        }
+        Err(error) => {
+            eprintln!("man-ai: terminal unavailable ({error}); showing the original");
+            write_original(input);
+            0
         }
     }
-    let mut out = io::stdout().lock();
-    let _ = out.write_all(input);
-    let _ = out.flush();
-    0
+}
+
+fn write_original(input: &[u8]) {
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(input);
+    let _ = stdout.flush();
 }

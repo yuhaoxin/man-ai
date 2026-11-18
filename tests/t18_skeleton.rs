@@ -86,7 +86,7 @@ fn help_打印用法与五个自有参数() {
     ] {
         assert!(text.contains(own), "帮助里缺少 {own}");
     }
-    for key in ["MANPAGER", "MAN_AI_PAGER"] {
+    for key in ["MANPAGER"] {
         assert!(text.contains(key), "帮助里缺少 {key}");
     }
     assert!(
@@ -185,13 +185,12 @@ fn 分页器模式忽略_stdin_为空的情形() {
 // ---------------------------------------------------------------- 薄壳模式：MANPAGER
 
 #[test]
-fn 薄壳保存原_manpager_并设为_man_ai() {
+fn 薄壳设_manpager_为自身() {
     let dir = TempDir::new("shell-save");
     let run = run_shell(&dir, "ls", &[("MANPAGER", "less -sR")], 0);
     assert_eq!(run.code, 0);
     assert_eq!(recorded_args(&run.record), "ls");
     assert_eq!(record_value(&run.record, "MANPAGER"), "man-ai");
-    assert_eq!(record_value(&run.record, "MAN_AI_PAGER"), "less -sR");
     assert_eq!(
         record_value(&run.record, "MAN_KEEP_FORMATTING"),
         "<unset>",
@@ -202,11 +201,10 @@ fn 薄壳保存原_manpager_并设为_man_ai() {
 }
 
 #[test]
-fn 薄壳原_manpager_为空时不保存() {
+fn 薄壳原_manpager_为空时也设为自身() {
     let dir = TempDir::new("shell-empty");
     let run = run_shell(&dir, "ls", &[("MANPAGER", "")], 0);
     assert_eq!(record_value(&run.record, "MANPAGER"), "man-ai");
-    assert_eq!(record_value(&run.record, "MAN_AI_PAGER"), "<unset>");
 }
 
 #[test]
@@ -236,27 +234,6 @@ fn 薄壳翻译开关最右生效并附加() {
     );
 }
 
-#[test]
-fn manpager_指向自身时不覆盖_man_ai_pager() {
-    let dir = TempDir::new("shell-self");
-    let run = run_shell(&dir, "ls", &[("MANPAGER", BIN)], 0);
-    assert_eq!(record_value(&run.record, "MANPAGER"), "man-ai");
-    assert_eq!(record_value(&run.record, "MAN_AI_PAGER"), "<unset>");
-
-    // 经符号链接解析后仍是 man-ai 自身。
-    let link = dir.path().join("man-ai-link");
-    std::os::unix::fs::symlink(BIN, &link).unwrap();
-    let run = run_shell(
-        &dir,
-        "ls",
-        &[
-            ("MAN_AI_PAGER", "cat"),
-            ("MANPAGER", &link.display().to_string()),
-        ],
-        0,
-    );
-    assert_eq!(record_value(&run.record, "MAN_AI_PAGER"), "cat");
-}
 
 #[test]
 fn 双破折号之后的自有参数照原样交给_man() {
@@ -291,7 +268,6 @@ fn p_覆盖时让路且不设_manpager() {
     );
     assert_eq!(recorded_args(&run.record), "-P less -X ls");
     assert_eq!(record_value(&run.record, "MANPAGER"), "less -sR");
-    assert_eq!(record_value(&run.record, "MAN_AI_PAGER"), "<unset>");
 
     for argv in ["--pager less ls", "--pager=less ls", "-aP less ls"] {
         let run = run_shell(&dir, argv, &[], 0);
@@ -310,11 +286,6 @@ fn 透传入口不修改_manpager_且退出码沿用_man() {
         let run = run_shell(&dir, argv, &[("MANPAGER", "less -sR")], 7);
         assert_eq!(run.code, 7, "{argv} 应透传退出码");
         assert_eq!(record_value(&run.record, "MANPAGER"), "less -sR", "{argv}");
-        assert_eq!(
-            record_value(&run.record, "MAN_AI_PAGER"),
-            "<unset>",
-            "{argv}"
-        );
     }
 }
 
@@ -335,182 +306,6 @@ fn 找不到_man_时退出_127() {
         &[("PATH", "/nonexistent"), ("TERM", "dumb")],
     );
     assert_eq!(code, 127);
-}
-
-// ---------------------------------------------------------------- 内层分页器链
-
-/// 在 pty 下跑分页器模式：stdin 是管道，stdout 是终端。
-fn run_pager_mode(dir: &TempDir, args: &str, extra_env: &[(&str, &str)], input: &str) -> PtyOut {
-    let stderr_file = dir.file("pager-stderr.txt");
-    let script = format!(
-        "printf '%s' '{input}' | '{BIN}' {args} 2>'{err}'\n",
-        err = stderr_file.display()
-    );
-    let mut env = vec![("HOME", dir.path().to_str().unwrap()), ("TERM", "dumb")];
-    env.extend_from_slice(extra_env);
-    let (mut output, code) = run_pty_command(dir, &script, &env);
-    let stderr = fs::read_to_string(&stderr_file).unwrap_or_default();
-    // 让调用方通过环境读到 stderr：warning 走文件，正文走 pty。
-    if !stderr.is_empty() {
-        output.extend_from_slice(format!("\n[stderr]{stderr}").as_bytes());
-    }
-    PtyOut { output, code }
-}
-
-#[test]
-fn 分页器链追加剩余_argv_并原样直通() {
-    let dir = TempDir::new("pager-args");
-    let pager = fake_pager(&dir, "pager", 0);
-    let extra = [("MAN_AI_PAGER", pager.to_str().unwrap())];
-    let pty = run_pager_mode(
-        &dir,
-        "--lang ja --no-translate -X -- --translate",
-        &extra,
-        "page line\n",
-    );
-    assert_eq!(pty.code, 0);
-    assert_eq!(pty_text(&pty.output), "page line\n");
-    assert_eq!(
-        fs::read_to_string(dir.path().join("pager-argv.txt")).unwrap(),
-        "-X -- --translate"
-    );
-}
-
-#[test]
-fn 分页器链按_man_ai_pager_再_pager() {
-    let dir = TempDir::new("pager-order");
-    let pager = fake_pager(&dir, "pager", 0);
-    let pty = run_pager_mode(&dir, "", &[("PAGER", pager.to_str().unwrap())], "x\n");
-    assert_eq!(pty.code, 0);
-    assert_eq!(pty_text(&pty.output), "x\n");
-    assert_eq!(
-        fs::read_to_string(dir.path().join("pager-argv.txt")).unwrap(),
-        ""
-    );
-
-    // MAN_AI_PAGER 优先于 PAGER。
-    let first = fake_pager(&dir, "first", 0);
-    let second = fake_pager(&dir, "second", 0);
-    let pty = run_pager_mode(
-        &dir,
-        "",
-        &[
-            ("MAN_AI_PAGER", first.to_str().unwrap()),
-            ("PAGER", second.to_str().unwrap()),
-        ],
-        "y\n",
-    );
-    assert_eq!(pty.code, 0);
-    assert!(dir.path().join("first-argv.txt").exists());
-    assert!(!dir.path().join("second-argv.txt").exists());
-}
-
-#[test]
-fn 拆词失败警告并跳到下一候选() {
-    let dir = TempDir::new("pager-badquote");
-    let pager = fake_pager(&dir, "pager", 0);
-    let pty = run_pager_mode(
-        &dir,
-        "",
-        &[
-            ("MAN_AI_PAGER", "pager 'unclosed"),
-            ("PAGER", pager.to_str().unwrap()),
-        ],
-        "ok\n",
-    );
-    assert_eq!(pty.code, 0);
-    let text = pty_text(&pty.output);
-    assert!(text.contains("cannot split inner pager command"), "{text}");
-    assert!(text.contains("ok\n"), "{text}");
-    assert!(dir.path().join("pager-argv.txt").exists());
-}
-
-#[test]
-fn 递归指向自身时跳到下一候选() {
-    let dir = TempDir::new("pager-loop");
-    let link = dir.path().join("man-ai");
-    std::os::unix::fs::symlink(BIN, &link).unwrap();
-    let pager = fake_pager(&dir, "pager", 0);
-    let pty = run_pager_mode(
-        &dir,
-        "",
-        &[
-            ("MAN_AI_PAGER", link.to_str().unwrap()),
-            ("PAGER", pager.to_str().unwrap()),
-        ],
-        "loop\n",
-    );
-    assert_eq!(pty.code, 0);
-    assert_eq!(pty_text(&pty.output), "loop\n");
-    assert!(dir.path().join("pager-argv.txt").exists());
-}
-
-#[test]
-fn 整条链不可用时直写_stdout_并退出零() {
-    let dir = TempDir::new("pager-none");
-    let pty = run_pager_mode(&dir, "", &[("PATH", "/nonexistent")], "裸写\n");
-    assert_eq!(pty.code, 0);
-    assert_eq!(pty_text(&pty.output), "裸写\n");
-}
-
-#[test]
-fn 分页器退出码透传() {
-    let dir = TempDir::new("pager-exit");
-    let pager = fake_pager(&dir, "pager", 3);
-    let pty = run_pager_mode(
-        &dir,
-        "",
-        &[("MAN_AI_PAGER", pager.to_str().unwrap())],
-        "x\n",
-    );
-    assert_eq!(pty.code, 3);
-}
-
-#[test]
-fn 分页器被信号杀死时为_128_加信号() {
-    let dir = TempDir::new("pager-signal");
-    write_script(&dir.path().join("killer"), "#!/bin/sh\nkill -TERM $$\n");
-    let pty = run_pager_mode(
-        &dir,
-        "",
-        &[("MAN_AI_PAGER", dir.path().join("killer").to_str().unwrap())],
-        "x\n",
-    );
-    assert_eq!(pty.code, 128 + 15);
-}
-
-// ---------------------------------------------------------------- 与平台 man 的字节差分
-
-#[test]
-fn 不翻译路径与平台_man_字节一致() {
-    let Some(real) = RealMan::new("t18-diff-page") else {
-        eprintln!("跳过：本机没有 man");
-        return;
-    };
-    let page = "1 man-ai-fixture";
-
-    let (baseline, baseline_stderr, baseline_code) = real.run(
-        "baseline",
-        &real.man_command(page),
-        &[("MANPAGER", "cat")],
-        "C.UTF-8",
-    );
-    let (ours, ours_stderr, ours_code) = real.run(
-        "ours",
-        &real.man_command(page),
-        &[
-            ("MANPAGER", "man-ai --no-translate"),
-            ("MAN_AI_PAGER", "cat"),
-        ],
-        "C.UTF-8",
-    );
-
-    assert_eq!(baseline_code, 0, "基线 man 失败：{baseline_stderr}");
-    assert_eq!(baseline_stderr, "", "基线 man 写了 stderr");
-    assert!(!baseline.is_empty(), "基线没有输出，fixture 页可能没找到");
-    assert_eq!(ours_stderr, "", "man-ai 路径写了 stderr");
-    assert_eq!(ours_code, baseline_code, "退出码应与平台 man 一致");
-    assert_bytes_eq(&ours, &baseline, "不翻译路径");
 }
 
 #[test]
