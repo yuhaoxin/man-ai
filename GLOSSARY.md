@@ -4,7 +4,7 @@
 
 ## 分页器模式（pager mode）
 
-stdin 不是 TTY 时 `man-ai` 的运行模式：`man` 把渲染后的页面写入 stdin，`man-ai` 翻译后交给内层分页器或 stdout。页面内容只在 stdin，argv 里没有页名。
+stdin 不是 TTY 时 `man-ai` 的运行模式：`man` 把渲染后的页面写入 stdin，`man-ai` 翻译后在阅读器或 stdout 上显示。页面内容只在 stdin，argv 里没有页名。
 
 ## 薄壳模式（shell mode）
 
@@ -14,9 +14,9 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 `man-ai` 二进制在薄壳模式下的角色：只处理自有参数、`MANPAGER` 与少数入口判定，页面检索和渲染全部交给平台 `man`。不用「包装器」「前端」指代它。
 
-## 内层分页器（inner pager）
+## 阅读器（reader）
 
-`man-ai` 在分页器模式中启动的分页器，按 `MAN_AI_PAGER` → `PAGER` → `less -sR` 解析。不要与 `man` 启动的 `man-ai` 混称「分页器」。
+`man-ai` 在 TTY 页面上接管终端显示的进程内 Markdown 阅读器：滚动、搜索、缩放重排由它承担，取代了外置分页器。不要与 `man` 启动的 `man-ai` 混称「分页器」。
 
 ## 块（block）
 
@@ -24,7 +24,7 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 页首行 / 尾行（header line / tail line）
 
-`man-ai` 写入内层分页器的第一行与最后一行，标明译文语言与整页翻译结果。
+阅读器正文前的第一行与全部块之后的最后一行，标明译文语言与整页翻译结果。
 
 ## 原因（reason）
 
@@ -38,9 +38,9 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 重试不会改变结果的失败：未配置、确定性 4xx（429 以外的 4xx）、重试一次后仍不可达的端点。发生后停止提交新块。
 
-## 首屏就绪（first screen ready）
+## 占位行（placeholder line）
 
-已按序写入的行数达到终端高度，或全部块处理完毕。此时启动内层分页器。
+翻译开始后、首块到达前阅读器顶部显示的一行暗色 `Translating… (waiting for the first block)`；首块写出即消失。
 
 ## 规范语言标签（canonical language tag）
 

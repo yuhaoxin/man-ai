@@ -44,11 +44,7 @@ impl PageKey {
     pub fn parse(pre: String) -> Option<Self> {
         let first = pre.split('\n').next().unwrap_or_default();
         let (name, section) = parse_header(first)?;
-        Some(Self {
-            name,
-            section,
-            pre,
-        })
+        Some(Self { name, section, pre })
     }
 
     fn file_stem(&self) -> String {
@@ -83,7 +79,12 @@ impl Cache {
         let state = self.state.as_ref()?;
         let comment = comment_line(parts, key)?;
         let content = fs::read_to_string(entry_path(&state.root, parts.lang, key)).ok()?;
-        Some(content.strip_prefix(&comment)?.strip_prefix('\n')?.to_string())
+        Some(
+            content
+                .strip_prefix(&comment)?
+                .strip_prefix('\n')?
+                .to_string(),
+        )
     }
 
     /// 整页落盘：注释行 + 译文，覆盖旧条目；失败只记一条告警（§9.2、§9.3）。
@@ -96,13 +97,11 @@ impl Cache {
         };
         let value = format!("{comment}\n{body}");
         let target = entry_path(&state.root, parts.lang, key);
-        if write_atomic(&state.root, &target, value.as_bytes()).is_err() {
-            if let Ok(mut slot) = state.warning.lock() {
-                if slot.is_none() {
+        if write_atomic(&state.root, &target, value.as_bytes()).is_err()
+            && let Ok(mut slot) = state.warning.lock()
+                && slot.is_none() {
                     *slot = Some("cache write failed; continuing without cache".to_string());
                 }
-            }
-        }
     }
 
     /// 取走待输出的告警；管线据此在分页器启动前写 stderr（§5.5）。
@@ -299,7 +298,8 @@ fn parse_header(line: &str) -> Option<(String, String)> {
     let body = line.strip_suffix(')')?;
     let open = body.rfind('(')?;
     let (name, section) = (&body[..open], &body[open + 1..]);
-    let safe = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | ':' | '~' | '-');
+    let safe =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | ':' | '~' | '-');
     if name.is_empty() || section.is_empty() {
         return None;
     }
@@ -543,9 +543,17 @@ mod tests {
             "<!-- v=3 prompt=3 endpoint=https://api.example.com/v1 model=m reasoning=low hash=1b8056e2b8f4fd9e72a6c1b9b3f1c305 -->\n译文\n"
                 .as_bytes()
         );
-        let mode = fs::metadata(dir.path().join("man-ai")).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(dir.path().join("man-ai"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o700);
-        let mode = fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o700);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -638,7 +646,12 @@ mod tests {
         let cache = cache_in(&dir);
         let old = SystemTime::now() - Duration::from_secs(86_400);
         let mut paths = Vec::new();
-        for (lang, stem) in [("zh-CN", "a.1"), ("zh-CN", "b.1"), ("ja", "c.1"), ("ja", "d.1")] {
+        for (lang, stem) in [
+            ("zh-CN", "a.1"),
+            ("zh-CN", "b.1"),
+            ("ja", "c.1"),
+            ("ja", "d.1"),
+        ] {
             let path = put_entry(&dir, lang, stem, 400_000);
             set_mtime(&path, old + Duration::from_secs(paths.len() as u64 * 60));
             paths.push(path);

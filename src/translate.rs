@@ -17,12 +17,10 @@ use crate::cache::{self, Cache, KeyParts};
 use crate::language::Language;
 use crate::output::Out;
 use crate::prompt;
+use crate::signals::CancelWatch;
 
 /// 重试前的固定等待（§7.7）。
 pub const RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// 轮询第一次 Ctrl-C 的间隔（§5.6）；在途请求据此丢弃。
-const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 /// 一次翻译运行需要的上下文。
 #[derive(Clone, Copy)]
@@ -100,7 +98,8 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let system = prompt::page(ctx.lang);
     let total = page.blocks.len();
     let stop = AtomicBool::new(false);
-    let interrupt = out.interrupt_flag().unwrap_or_default();
+    let cancel = out.cancel();
+    let cancel_after = cancel.clone();
     let mut adopted = 0;
     let mut failures: Vec<Reason> = Vec::new();
     let mut diagnosed = false;
@@ -122,15 +121,15 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let page_key = parts.and_then(|_| cache::PageKey::parse(pre_text(&page)));
 
     /* 整页缓存命中：剥注释行直出，零请求（§9.3）；--retranslate 跳过读取。 */
-    if !ctx.retranslate {
-        if let (Some(parts), Some(key)) = (parts, page_key.as_ref()) {
-            if let Some(body) = cache.get_page(&parts, key) {
+    if !ctx.retranslate
+        && let (Some(parts), Some(key)) = (parts, page_key.as_ref())
+            && let Some(body) = cache.get_page(&parts, key) {
                 let whole = Block {
                     gap_before: 0,
                     raw: Vec::new(),
                     pre: String::new(),
                 };
-                out.write_block(&whole, body.as_bytes())?;
+                out.write_block(&whole, body.as_str())?;
                 let outcome = Outcome {
                     adopted: total,
                     total,
@@ -143,34 +142,34 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                 }
                 return Ok(outcome);
             }
-        }
-    }
 
     let system = system.as_str();
     let stop_ref = &stop;
-    let interrupt_ref = &interrupt;
     let results = stream::iter(page.blocks)
-        .map(move |block| async move {
-            /* 确定性失败或第一次 Ctrl-C 之后，未开始的块不再发请求。 */
-            if stop_ref.load(Ordering::Relaxed) || interrupt_ref.load(Ordering::Relaxed) {
-                return BlockResult::original(block);
-            }
-            let Some(backend) = backend else {
-                stop_ref.store(true, Ordering::Relaxed);
-                return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
-            };
-            match translate_block(backend, system, &block.pre, stop_ref, interrupt_ref).await {
-                Ok(translation) => BlockResult {
-                    block,
-                    translation: Some(translation),
-                    failure: None,
-                },
-                Err(failure) => {
-                    /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
-                    if stops_submission(&failure) {
-                        stop_ref.store(true, Ordering::Relaxed);
+        .map(move |block| {
+            let cancel = cancel.clone();
+            async move {
+                /* 确定性失败或翻译期间的 Ctrl-C 之后，未开始的块不再发请求。 */
+                if stop_ref.load(Ordering::Relaxed) || cancel.triggered() {
+                    return BlockResult::original(block);
+                }
+                let Some(backend) = backend else {
+                    stop_ref.store(true, Ordering::Relaxed);
+                    return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
+                };
+                match translate_block(backend, system, &block.pre, stop_ref, &cancel).await {
+                    Ok(translation) => BlockResult {
+                        block,
+                        translation: Some(translation),
+                        failure: None,
+                    },
+                    Err(failure) => {
+                        /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
+                        if stops_submission(&failure) {
+                            stop_ref.store(true, Ordering::Relaxed);
+                        }
+                        BlockResult::failed(block, failure)
                     }
-                    BlockResult::failed(block, failure)
                 }
             }
         })
@@ -181,11 +180,11 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     while let Some(result) = results.next().await {
         if let Some(failure) = &result.failure {
             /* 每进程最多输出一条失败诊断，取第一个失败（§10.5）。 */
-            if let Some(line) = &failure.diagnostic {
-                if !diagnosed {
-                    out.diagnostic(line);
-                    diagnosed = true;
-                }
+            if let Some(line) = &failure.diagnostic
+                && !diagnosed
+            {
+                out.diagnostic(line);
+                diagnosed = true;
             }
             if failure.reason == Reason::Interrupted {
                 stop.store(true, Ordering::Relaxed);
@@ -200,11 +199,11 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         if result.translation.is_some() {
             adopted += 1;
         }
-        let body_bytes = match &result.translation {
-            Some(translation) => translation.as_bytes(),
-            None => result.block.pre.as_bytes(),
+        let text = match &result.translation {
+            Some(translation) => translation.as_str(),
+            None => result.block.pre.as_str(),
         };
-        out.write_block(&result.block, body_bytes)?;
+        out.write_block(&result.block, text)?;
         if let Some(translation) = &result.translation {
             body.extend(std::iter::repeat_n('\n', result.block.gap_before));
             body.push_str(translation);
@@ -212,13 +211,13 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         if let Some(line) = ctx.cache.take_warning() {
             out.diagnostic(&line);
         }
-        /* 分页器提前退出：丢弃在途请求、停止写入（§8.2）。 */
+        /* 阅读器退出（q）：丢弃在途请求、停止写入（§8.5）。 */
         if out.broken() {
             break;
         }
     }
 
-    let interrupted = interrupt.load(Ordering::Relaxed);
+    let interrupted = cancel_after.triggered();
     let outcome = Outcome {
         adopted,
         total,
@@ -230,11 +229,10 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         out.write_tail(&outcome)?;
     }
     /* 全部块采用才整页落盘；提前退出时已完整的页照常写（§9.3）。 */
-    if adopted == total && total > 0 {
-        if let (Some(parts), Some(key)) = (parts, page_key.as_ref()) {
+    if adopted == total && total > 0
+        && let (Some(parts), Some(key)) = (parts, page_key.as_ref()) {
             cache.put_page(&parts, key, &body);
         }
-    }
     Ok(outcome)
 }
 
@@ -277,20 +275,20 @@ enum Verdict {
 
 /// 一块的完整尝试：最多重试一次，重试前等 500ms（§7.7）。
 ///
-/// 确定性失败之后不再发起重试；第一次 Ctrl-C 直接放弃该块。
+/// 确定性失败之后不再发起重试；翻译期间的 Ctrl-C 直接放弃该块。
 async fn translate_block(
     backend: &Backend,
     system: &str,
     input: &str,
     stop: &AtomicBool,
-    interrupt: &AtomicBool,
+    cancel: &CancelWatch,
 ) -> Result<String, Failure> {
     let mut retried = false;
     loop {
-        if interrupt.load(Ordering::Relaxed) {
+        if cancel.triggered() {
             return Err(Failure::new(Reason::Interrupted, false));
         }
-        let verdict = match post(backend, system, input, interrupt).await {
+        let verdict = match post(backend, system, input, cancel.clone()).await {
             Ok(completion) => evaluate(&completion),
             Err(failure) => {
                 if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
@@ -315,24 +313,18 @@ async fn translate_block(
     }
 }
 
-/// 单次请求；第一次 Ctrl-C 时丢弃在途 future，不等它返回（§5.6）。
+/// 单次请求；取消触发时丢弃在途 future，不等它返回（§5.4）。
 async fn post(
     backend: &Backend,
     system: &str,
     input: &str,
-    interrupt: &AtomicBool,
+    mut cancel: CancelWatch,
 ) -> Result<Completion, Failure> {
     let request = backend.post(system, input);
     futures::pin_mut!(request);
-    loop {
-        tokio::select! {
-            result = &mut request => return result,
-            () = tokio::time::sleep(CANCEL_POLL) => {
-                if interrupt.load(Ordering::Relaxed) {
-                    return Err(Failure::new(Reason::Interrupted, false));
-                }
-            }
-        }
+    tokio::select! {
+        result = &mut request => result,
+        () = cancel.cancelled() => Err(Failure::new(Reason::Interrupted, false)),
     }
 }
 

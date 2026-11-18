@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use common::{
     FakeModel, Reply, TempDir, cache_env, completion, env_refs, error_body, model_config,
-    run_pager_tty, run_pipe, text,
+    model_config_with, run_pipe, text,
 };
 
 const LANG: &str = "zh-CN";
@@ -176,19 +176,43 @@ fn 页眉解析失败的页不缓存() {
 }
 
 #[test]
-fn 命中不改首屏与顺序() {
+fn 命中零请求且阅读器输出一致() {
     let dir = TempDir::new("t22-order");
     let model = headered_model();
-    dir.write_config(&model_config(&model, ""));
+    dir.write_config(&model_config_with(&model, 4, ""));
     let env = cache_env(&dir);
-    let env = env_refs(&env);
 
-    let first = run_pager_tty(&dir, &["--lang", LANG], INPUT, &env);
+    let run = |dir: &TempDir| {
+        common::run_reader_tty(
+            dir,
+            &["--lang", LANG],
+            INPUT,
+            &env,
+            "── man-ai: translated (Simplified Chinese) ──",
+            &["q"],
+        )
+    };
+    let first = run(&dir);
     assert_eq!(model.count(), 2);
-    let second = run_pager_tty(&dir, &["--lang", LANG], INPUT, &env);
+    let second = run(&dir);
     assert_eq!(model.count(), 2, "命中不应再发请求");
-    assert_eq!(second.output, first.output);
-    assert!(text(&second.output).contains("── man-ai: translation"));
+    // 阅读器输出含页首行与尾行；elapsed 各不相同，不比较时间行。
+    // ratatui 的帧 diff 跳过空格，断言前去掉空格。
+    for text in [first.text(), second.text()] {
+        let compact = common::compact(&text);
+        assert!(
+            compact.contains("──man-ai:translation(SimplifiedChinese)──"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("──man-ai:translated(SimplifiedChinese)──"),
+            "{compact}"
+        );
+        assert!(compact.contains("页眉译文"), "{compact}");
+        assert!(compact.contains("正文译文"), "{compact}");
+    }
+    assert_eq!(first.code, 0);
+    assert_eq!(second.code, 0);
 }
 
 #[test]
