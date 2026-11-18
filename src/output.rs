@@ -43,16 +43,20 @@ pub fn tail_text(language: &str, outcome: &Outcome) -> Option<String> {
     }
 }
 
-/// 阅读器内容消息；`Block` 的 `gap` 是块前空行数。
+/// 阅读器内容消息；`Block` 与 `Live` 的 `gap` 是块前空行数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     Header(String),
+    /// 完成块：按 `gap` 补空行后整块出现（§8.1）。
     Block { gap: usize, body: String },
+    /// 直播块的当前累积文本；同一块多次发送时替换直播段并重解析（§8.1）。
+    Live { gap: usize, text: String },
+    /// 状态行注记（§8.5）：`retrying` 或 `fallback: <reason>`。
+    Note(String),
     Diagnostic(String),
     Tail(String),
     Done,
 }
-
 enum Sink {
     /// 非 TTY：按块序直写 stdout。
     Stdout,
@@ -162,6 +166,24 @@ impl Out {
         Ok(0)
     }
 
+    /// 直播块的当前累积文本；非 TTY 不写（增量只进阅读器，§5.3）。
+    pub fn write_live(&mut self, gap: usize, text: &str) -> io::Result<()> {
+        if matches!(self.sink, Sink::Channel(_)) {
+            self.send(Message::Live {
+                gap,
+                text: text.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 状态行注记；非 TTY 不写。
+    pub fn note(&mut self, text: &str) {
+        if matches!(self.sink, Sink::Channel(_)) {
+            self.send(Message::Note(text.to_string()));
+        }
+    }
+
     /// 发送并跟踪写端：阅读器退出后发送失败即视为 EPIPE。
     fn send(&mut self, message: Message) {
         let failed = match &self.sink {
@@ -186,6 +208,7 @@ mod tests {
             reason,
             deterministic: false,
             interrupted: false,
+            usages: Vec::new(),
         }
     }
 

@@ -297,7 +297,7 @@ struct SplitPage {
 
 ### 7.2 系统提示词
 
-`PROMPT_VERSION = 3`。模板措辞或固定请求参数（`temperature`、`stream`、`stream_options`）变化时递增，该值进入缓存键字段（§9.1）。
+`PROMPT_VERSION = 4`（固定请求参数改为 `stream: true` + `stream_options.include_usage`，自 3 递增）。模板措辞或固定请求参数（`temperature`、`stream`、`stream_options`）变化时递增，该值进入缓存键字段（§9.1）。
 
 ```text
 You translate Linux and macOS manual pages into {TARGET_LANGUAGE}.
@@ -490,12 +490,12 @@ stateDiagram-v2
 - 文件内容 = 整页译文 Markdown；首行是 HTML 注释形式的缓存键字段：
 
 ```html
-<!-- v=3 prompt=3 endpoint=<规范化端点> model=<模型名> reasoning=<思考强度> hash=<32位小写十六进制> -->
+<!-- v=3 prompt=4 endpoint=<规范化端点> model=<模型名> reasoning=<思考强度> hash=<32位小写十六进制> -->
 ```
 
 - 字段以单个空格分隔，值中的空格以 `%20` 转义。字段含义：
   - `v=3`：协议版本。缓存布局或键字段语义变化时递增。
-  - `prompt=3`：提示词版本。提示词模板或固定请求参数（`temperature`、`stream`、`stream_options`）变更时递增。
+  - `prompt=4`：提示词版本。提示词模板或固定请求参数（`temperature`、`stream`、`stream_options`）变更时递增。
   - `endpoint`：规范化端点。scheme 与 host 转小写、去默认端口（http 80、https 443）、去尾部 `/`，保留路径；查询串与片段不参与请求构造，含查询串或片段的 endpoint 按配置错误处理。
   - `model`：模型名按配置原样（大小写敏感）。
   - `reasoning`：思考强度。配置为空写 `off`，否则写 `reasoning_effort` 的小写取值。

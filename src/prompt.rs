@@ -5,7 +5,7 @@
 use crate::language::Language;
 
 /// 模板措辞或固定请求参数变化时递增；该值进入缓存键（§9.1）。
-pub const PROMPT_VERSION: u32 = 3;
+pub const PROMPT_VERSION: u32 = 4;
 
 /// 整页翻译的系统提示（§7.2）。
 pub const PAGE_PROMPT: &str = r#"You translate Linux and macOS manual pages into {TARGET_LANGUAGE}.
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn 版本号按规格() {
-        assert_eq!(PROMPT_VERSION, 3);
+        assert_eq!(PROMPT_VERSION, 4);
     }
 
     #[test]
