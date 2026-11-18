@@ -6,7 +6,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream;
@@ -59,9 +59,6 @@ pub struct Outcome {
     pub deterministic: bool,
     /// 第一次 Ctrl-C 中断了翻译。
     pub interrupted: bool,
-    /// 被采用请求的 usage，按块序（§8.3 后续指标票的消费接口；
-    /// 失败与回退请求不计入）。
-    pub usages: Vec<Usage>,
 }
 
 impl Outcome {
@@ -83,8 +80,9 @@ struct BlockResult {
     block: Block,
     translation: Option<String>,
     failure: Option<Failure>,
-    /// 被采用请求的 usage；失败与未尝试为 `None`。
+    /// 被采用请求的 usage 与生成窗口（§8.3）；失败与未尝试为 `None`。
     usage: Option<Usage>,
+    window: Option<Duration>,
 }
 
 impl BlockResult {
@@ -94,6 +92,7 @@ impl BlockResult {
             translation: None,
             failure: None,
             usage: None,
+            window: None,
         }
     }
 
@@ -103,6 +102,7 @@ impl BlockResult {
             translation: None,
             failure: Some(failure),
             usage: None,
+            window: None,
         }
     }
 }
@@ -145,13 +145,14 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                 pre: String::new(),
             };
             out.write_block(&whole, body.as_str())?;
+            /* 状态行从接管起算，只显示流逝时间与 cache hit（§8.3）。 */
+            out.cache_hit();
             let outcome = Outcome {
                 adopted: total,
                 total,
                 reason: None,
                 deterministic: false,
                 interrupted: false,
-                usages: Vec::new(),
             };
             if !out.broken() {
                 out.write_tail(&outcome)?;
@@ -182,11 +183,12 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                     )
                     .await
                     {
-                        Ok((translation, usage)) => BlockResult {
+                        Ok((translation, usage, window)) => BlockResult {
                             block,
                             translation: Some(translation),
                             failure: None,
                             usage,
+                            window: Some(window),
                         },
                         Err(failure) => {
                             /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
@@ -218,7 +220,6 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         diagnosed: false,
         deterministic: false,
         body: String::new(),
-        usages: Vec::new(),
     };
     let mut done_workers = 0;
     loop {
@@ -255,7 +256,6 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         failures,
         deterministic,
         body,
-        usages,
         ..
     } = writer;
 
@@ -266,7 +266,6 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         reason: most_common(&failures),
         deterministic: deterministic || interrupted,
         interrupted,
-        usages,
     };
     if !out.broken() {
         out.write_tail(&outcome)?;
@@ -298,8 +297,6 @@ struct Writer<'a> {
     deterministic: bool,
     /// 整页译文（全部采用才落盘，§9.3）。
     body: String,
-    /// 被采用请求的 usage，按块序（§8.3）。
-    usages: Vec<Usage>,
 }
 
 impl Writer<'_> {
@@ -328,6 +325,11 @@ impl Writer<'_> {
                 }
             }
             Event::Finished { index, result } => {
+                if result.translation.is_some() {
+                    /* out 随 usage 到达跳增、TPS 同时重算（§8.3）：事件先于落定。 */
+                    self.out
+                        .metric(result.usage, result.window.unwrap_or_default());
+                }
                 self.account(&result);
                 self.pending[index] = Some(result);
                 /* 按序落定：直播块完成即推进，静默累积的块轮到后整块出现。 */
@@ -361,7 +363,7 @@ impl Writer<'_> {
         }
     }
 
-    /// 落定一块：采用译文或回退预转换原文（§6.4）；整页译文与 usage 同步累积。
+    /// 落定一块：采用译文或回退预转换原文（§6.4）；整页译文同步累积。
     fn finalize(&mut self, result: BlockResult) {
         let fallback = match (&result.translation, &result.failure) {
             (Some(_), _) => None,
@@ -382,9 +384,6 @@ impl Writer<'_> {
             self.body
                 .extend(std::iter::repeat_n('\n', result.block.gap_before));
             self.body.push_str(translation);
-        }
-        if let Some(usage) = result.usage {
-            self.usages.push(usage);
         }
     }
 }
@@ -430,7 +429,7 @@ enum Verdict {
 /// 一块的完整尝试：最多重试一次，重试前等 500ms 并清空已显示内容（§7.5）。
 ///
 /// 确定性失败之后不再发起重试；翻译期间的 Ctrl-C 直接放弃该块。
-/// 返回译文与被采用请求的 usage。
+/// 返回译文与被采用请求的 usage 及其生成窗口。
 async fn translate_block(
     backend: &Backend,
     system: &str,
@@ -439,12 +438,14 @@ async fn translate_block(
     events: &tokio::sync::mpsc::UnboundedSender<Event>,
     stop: &AtomicBool,
     cancel: &CancelWatch,
-) -> Result<(String, Option<Usage>), Failure> {
+) -> Result<(String, Option<Usage>, Duration), Failure> {
     let mut retried = false;
     loop {
         if cancel.triggered() {
             return Err(Failure::new(Reason::Interrupted, false));
         }
+        /* 生成窗口从请求发出起算；只有被采用的那次尝试才上报（§8.3）。 */
+        let sent = Instant::now();
         let outcome = match post(backend, system, input, index, events, cancel.clone()).await {
             Ok(completion) => match evaluate(&completion) {
                 Verdict::Accepted(text) => Some(Ok((text, completion.usage))),
@@ -452,9 +453,10 @@ async fn translate_block(
             },
             Err(failure) => Some(Err(failure)),
         };
+        let window = sent.elapsed();
         if let Some(result) = outcome {
             return match result {
-                Ok(accepted) => Ok(accepted),
+                Ok((text, usage)) => Ok((text, usage, window)),
                 Err(failure) => {
                     if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
                         retried = true;

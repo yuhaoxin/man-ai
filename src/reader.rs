@@ -1,7 +1,7 @@
 //! 进程内 Markdown 阅读器（规格 §8）。
 //!
 //! 阅读器接管终端（raw 模式 + 备用屏幕 + 鼠标），完成块按序整块出现；滚动、
-//! 搜索、缩放重排在所有 TTY 页面行为一致；底部状态行只显示 `elapsed <t>`。
+//! 搜索、缩放重排在所有 TTY 页面行为一致；底部状态行显示整页指标（§8.3）。
 //! Ctrl-C 是按键：翻译期间第一次取消剩余翻译，翻译结束后等同 `q`。
 //!
 //! 按键与鼠标事件不经过 `crossterm::event`：它的 Unix 事件源基于 kqueue，
@@ -32,6 +32,7 @@ use signal_hook::consts::SIGWINCH;
 use signal_hook::low_level;
 
 use crate::markdown;
+use crate::metrics::PageMetrics;
 use crate::output::Message;
 use crate::signals::{self, CancelTrigger};
 
@@ -287,6 +288,7 @@ pub fn serve_translating(
 pub fn serve_static(guard: &mut TermGuard, original: String) -> ReaderExit {
     let mut view = View::new(Instant::now());
     view.translating = false;
+    view.show_metrics = false;
     view.update(Message::Block {
         gap: 0,
         body: original,
@@ -382,6 +384,10 @@ struct View {
     search: Search,
     /// 状态行注记（§8.5）：`retrying` 或 `fallback: <reason>`。
     note: Option<String>,
+    /// 整页指标（§8.3）：usage 事件由内容消息驱动。
+    metrics: PageMetrics,
+    /// 不翻译的 TTY 页面状态行只显示 elapsed（§8.2）。
+    show_metrics: bool,
     diagnostics: Vec<String>,
 }
 
@@ -414,6 +420,8 @@ impl View {
             viewport: 0,
             search: Search::Idle,
             note: None,
+            metrics: PageMetrics::default(),
+            show_metrics: true,
             diagnostics: Vec::new(),
         }
     }
@@ -462,6 +470,8 @@ impl View {
                 self.lines.extend(rendered);
             }
             Message::Note(text) => self.note = Some(text),
+            Message::Metric { usage, window } => self.metrics.record(usage, window),
+            Message::CacheHit => self.metrics.cache_hit = true,
             Message::Diagnostic(line) => self.diagnostics.push(line),
             Message::Tail(text) => {
                 self.lines.push(Line::from(""));
@@ -658,20 +668,21 @@ impl View {
             .scroll((self.offset as u16, 0));
         frame.render_widget(paragraph, content);
         let status_line = match &self.search {
-            Search::Idle => self.status(),
+            Search::Idle => self.status(status.width as usize),
             Search::Typing(query) => format!("/{query}"),
             Search::Active { query, .. } => format!("/{query}"),
         };
         frame.render_widget(Paragraph::new(status_line), status);
     }
 
-    /// 状态行：elapsed 加直播注记（§8.5 注记在指标字段之外）。
-    fn status(&self) -> String {
-        let mut line = format!("elapsed {:.1}s", self.elapsed().as_secs_f32());
-        if let Some(note) = &self.note {
-            line.push_str(&format!(" · {note}"));
+    /// 状态行：整页指标（§8.3）；注记在指标字段之外。
+    fn status(&self, width: usize) -> String {
+        if !self.show_metrics {
+            /* 不翻译的 TTY 页面只显示流逝时间（§8.2）。 */
+            return format!("elapsed {:.1}s", self.elapsed().as_secs_f32());
         }
-        line
+        self.metrics
+            .status_line(self.elapsed(), self.note.as_deref(), width)
     }
 
     /// 占位行只在正文里时摘掉。
@@ -691,6 +702,7 @@ impl View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Usage;
     use ratatui::backend::TestBackend;
 
     /// 解析结果：消化字节块后收到的事件。
@@ -840,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn 状态行常驻底部只显示_elapsed() {
+    fn 状态行常驻底部显示整页指标() {
         let mut view = translating_view();
         view.update(Message::Block {
             gap: 0,
@@ -848,14 +860,70 @@ mod tests {
         });
         view.update(Message::Done);
         let screen = render(&mut view, 60, 8);
+        // 五字段按固定顺序出现（§8.3）；数值口径在 metrics 模块断言。
         assert!(screen[7].starts_with("elapsed "), "{}", screen[7]);
-        assert!(screen[7].ends_with('s'), "{}", screen[7]);
+        for field in ["out ", "tps ", "cached ", "in "] {
+            assert!(screen[7].contains(&format!("· {field}")), "{}", screen[7]);
+        }
         assert!(
             !screen
                 .iter()
                 .take(7)
                 .any(|line| line.starts_with("elapsed"))
         );
+    }
+
+    #[test]
+    fn 指标随usage事件跳增() {
+        let mut view = translating_view();
+        view.update(Message::Live {
+            gap: 0,
+            text: "直播中".to_string(),
+        });
+        let streaming = render(&mut view, 60, 8);
+        assert!(streaming[7].contains("out 0"), "{}", streaming[7]);
+
+        // 被采用请求的 usage 到达：out 跳增、TPS 同时重算（§8.3）。
+        view.update(Message::Metric {
+            usage: Some(Usage {
+                prompt_tokens: 120,
+                completion_tokens: 7,
+                cached_tokens: Some(64),
+            }),
+            window: Duration::from_secs(1),
+        });
+        let jumped = render(&mut view, 60, 8);
+        assert!(jumped[7].contains("out 7"), "{}", jumped[7]);
+        assert!(jumped[7].contains("tps 7"), "{}", jumped[7]);
+    }
+
+    #[test]
+    fn 整页缓存命中_状态行只有elapsed与cache_hit() {
+        let mut view = translating_view();
+        view.update(Message::CacheHit);
+        view.update(Message::Block {
+            gap: 0,
+            body: "缓存页\n".to_string(),
+        });
+        view.update(Message::Done);
+        let screen = render(&mut view, 60, 8);
+        assert!(screen[7].contains("cache hit"), "{}", screen[7]);
+        assert!(!screen[7].contains("out"), "{}", screen[7]);
+    }
+
+    #[test]
+    fn 不翻译页面状态行只有elapsed() {
+        let mut view = View::new(Instant::now());
+        view.translating = false;
+        view.show_metrics = false;
+        view.update(Message::Block {
+            gap: 0,
+            body: "原文\n".to_string(),
+        });
+        view.update(Message::Done);
+        let screen = render(&mut view, 60, 8);
+        assert!(screen[7].starts_with("elapsed "), "{}", screen[7]);
+        assert!(!screen[7].contains("out"), "{}", screen[7]);
     }
 
     #[test]

@@ -5,7 +5,9 @@
 
 use std::io::{self, Write};
 use std::sync::mpsc;
+use std::time::Duration;
 
+use crate::backend::Usage;
 use crate::blocks::Block;
 use crate::signals::{self, CancelWatch};
 use crate::translate::Outcome;
@@ -53,6 +55,10 @@ pub enum Message {
     Live { gap: usize, text: String },
     /// 状态行注记（§8.5）：`retrying` 或 `fallback: <reason>`。
     Note(String),
+    /// 被采用请求的 usage 与生成窗口（§8.3）；usage 缺失即 `None`。
+    Metric { usage: Option<Usage>, window: Duration },
+    /// 整页缓存命中（§8.3）：状态行只显示 elapsed 与 cache hit。
+    CacheHit,
     Diagnostic(String),
     Tail(String),
     Done,
@@ -184,6 +190,20 @@ impl Out {
         }
     }
 
+    /// 被采用请求的 usage 与生成窗口（§8.3）；非 TTY 不写。
+    pub fn metric(&mut self, usage: Option<Usage>, window: Duration) {
+        if matches!(self.sink, Sink::Channel(_)) {
+            self.send(Message::Metric { usage, window });
+        }
+    }
+
+    /// 整页缓存命中（§8.3）；非 TTY 不写。
+    pub fn cache_hit(&mut self) {
+        if matches!(self.sink, Sink::Channel(_)) {
+            self.send(Message::CacheHit);
+        }
+    }
+
     /// 发送并跟踪写端：阅读器退出后发送失败即视为 EPIPE。
     fn send(&mut self, message: Message) {
         let failed = match &self.sink {
@@ -208,7 +228,6 @@ mod tests {
             reason,
             deterministic: false,
             interrupted: false,
-            usages: Vec::new(),
         }
     }
 
@@ -289,5 +308,24 @@ mod tests {
         // 写端坏掉后尾行不再发。
         out.write_tail(&outcome(1, 1, None)).unwrap();
         let _ = out.finish();
+    }
+
+    #[test]
+    fn 通道路径转发指标事件与缓存命中() {
+        let (sender, receiver) = mpsc::channel();
+        let (_trigger, cancel) = crate::signals::cancel_pair();
+        let mut out = Out::channel(sender, cancel);
+        out.metric(None, Duration::from_secs(1));
+        out.cache_hit();
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<Message>>(),
+            vec![
+                Message::Metric {
+                    usage: None,
+                    window: Duration::from_secs(1)
+                },
+                Message::CacheHit,
+            ]
+        );
     }
 }
