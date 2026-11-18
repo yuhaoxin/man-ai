@@ -400,22 +400,6 @@ pub fn fake_man(dir: &TempDir, page: &[u8], code: i32) -> PathBuf {
     record
 }
 
-/// 写一个假 `man -k`：输出结果行，并把收到的 `WHATISPAGER` 记录到 `whatispager-record.txt`。
-pub fn fake_kman(dir: &TempDir, output: &[u8], code: i32) -> PathBuf {
-    let fixture = dir.file("kpage.bin");
-    fs::write(&fixture, output).unwrap();
-    let record = dir.file("whatispager-record.txt");
-    write_script(
-        &dir.file("man"),
-        &format!(
-            "#!/bin/sh\nprintf '%s' \"${{WHATISPAGER-<unset>}}\" > '{}'\n/bin/cat '{}'\nexit {code}\n",
-            record.display(),
-            fixture.display()
-        ),
-    );
-    record
-}
-
 /// 记录 man 实际收到的 argv 与关键环境变量，然后按给定退出码退出。
 pub fn recording_man(dir: &TempDir, exit_code: i32) -> PathBuf {
     let record = dir.file("man-record.txt");

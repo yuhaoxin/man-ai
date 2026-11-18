@@ -16,7 +16,7 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 内层分页器（inner pager）
 
-`man-ai` 在分页器模式或 `-k` 拦截路径中启动的分页器，按 `MAN_AI_PAGER` → `PAGER` → `less -sR` 解析。不要与 `man` 启动的 `man-ai` 混称「分页器」。
+`man-ai` 在分页器模式中启动的分页器，按 `MAN_AI_PAGER` → `PAGER` → `less -sR` 解析。不要与 `man` 启动的 `man-ai` 混称「分页器」。
 
 ## 块（block）
 
@@ -24,11 +24,11 @@ stdin 是 TTY 时 `man-ai` 的运行模式：设置 `MANPAGER` 后 `exec` 平台
 
 ## 页首行 / 尾行（header line / tail line）
 
-`man-ai` 写入内层分页器的第一行与最后一行，标明译文语言与整页翻译结果。`-k` 路径只有页首行。
+`man-ai` 写入内层分页器的第一行与最后一行，标明译文语言与整页翻译结果。
 
 ## 形态（form）
 
-缓存键中的翻译单元形态：`page`（整页块）或 `k`（`-k`/`-f` 描述批）。两种形态互不命中。
+缓存键中的翻译单元形态：`page`（整页块）。
 
 ## 原因（reason）
 
