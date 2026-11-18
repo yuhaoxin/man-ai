@@ -159,9 +159,7 @@ impl Renderer {
         }
         // 一个事件可以带多行内容（围栏代码块整块到达）；行内换行折行。
         let mut segments = text.split('\n');
-        let Some(first) = segments.next() else {
-            return;
-        };
+        let first = segments.next().expect("split 至少产出一段");
         let style = self.style();
         self.spans.push(Span::styled(first.to_string(), style));
         let rest: Vec<&str> = segments.collect();

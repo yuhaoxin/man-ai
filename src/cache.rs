@@ -42,7 +42,7 @@ pub struct PageKey {
 impl PageKey {
     /// 第一行页眉 `NAME(SECTION)` 解析失败时返回 `None`，该页不缓存（§9.1）。
     pub fn parse(pre: String) -> Option<Self> {
-        let first = pre.split('\n').next().unwrap_or_default();
+        let first = pre.split('\n').next().expect("split 至少产出一段");
         let (name, section) = parse_header(first)?;
         Some(Self { name, section, pre })
     }

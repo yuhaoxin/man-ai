@@ -10,7 +10,7 @@ homepage = "https://github.com/yuhaoxin/man-ai"
 readme = "README.md"
 
 [dependencies]
-async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "rustls", "middleware"] }
+async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "rustls", "middleware", "byot"] }
 blake3 = "1.8.7"
 futures = "0.3.34"
 libc = "0.2.191"
@@ -19,6 +19,7 @@ pulldown-cmark = "0.13"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks"] }
 serde_json = "1.0.154"
+serde = { version = "1", features = ["derive"] }
 signal-hook = "0.4.6"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

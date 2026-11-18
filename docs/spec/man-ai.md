@@ -297,7 +297,7 @@ struct SplitPage {
 
 ### 7.2 系统提示词
 
-`PROMPT_VERSION = 4`（固定请求参数改为 `stream: true` + `stream_options.include_usage`，自 3 递增）。模板措辞或固定请求参数（`temperature`、`stream`、`stream_options`）变化时递增，该值进入缓存键字段（§9.1）。
+`PROMPT_VERSION = 4`（固定请求参数含 `temperature`、`stream: true` 与 `stream_options.include_usage`）。模板措辞或固定请求参数变化时递增，该值进入缓存键字段（§9.1）。
 
 ```text
 You translate Linux and macOS manual pages into {TARGET_LANGUAGE}.
@@ -362,7 +362,7 @@ Rules:
 - 重试开始时清空该块已显示内容，从空内容重新直播；屏幕上只出现当前这次尝试的内容。
 - 重试后仍失败：该块写预转换原文，其余块继续，不停止提交。
 - `usage` 取流中最后一个非空 usage 块（OpenAI 的独立 usage 块与 DeepSeek 挂在内容块上的形态都覆盖）；缺失即未知，口径见 §8.3。
-- async-openai 0.43 的错误映射：中途 error 帧表现为 `JSONDeserialize`；传输层错误压成 `StreamError`，超时与断连在其中不可区分，因此超时由自有计时器判定。
+- async-openai 0.43（`byot`）用自有响应类型反序列化：中途 error 帧显式识别为可重试失败；传输层错误压成 `StreamError`，超时与断连在其中不可区分，因此超时由自有计时器判定。
 
 ```mermaid
 stateDiagram-v2
@@ -904,7 +904,7 @@ v1 不签名、不公证：
 - `content` 分块 delta 正常流。
 - `include_usage` 独立 usage 块与 usage 挂在内容块上（DeepSeek 形态）。
 - usage 缺失（所有块 `usage` 为 `null`）。
-- 中途 error 帧（async-openai 表现为 `JSONDeserialize`）。
+- 中途 error 帧。
 - 写一半断开。
 - `finish_reason="length"`。
 - 空 content。
@@ -933,10 +933,10 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 | 能力 | 选择 | 理由 |
 |---|---|---|
 | CLI 解析 | 手写（约 40 行） | 未知参数与 `--` 之后必须按原序原样交回 man；clap 会在未知参数上报错或吞进匹配分支，保不住原序 |
-| HTTP 客户端 | `async-openai 0.43`（`chat-completion` + `rustls` + `middleware`） | 复用 OpenAI 兼容流式请求/响应类型；`with_http_service(ReqwestService)` 绕过库内置重试；中途 error 帧表现为 `JSONDeserialize`，传输层错误压成 `StreamError` |
+| HTTP 客户端 | `async-openai 0.43`（`chat-completion` + `rustls` + `middleware` + `byot`） | 复用 OpenAI 兼容请求类型；`with_http_service(ReqwestService)` 绕过库内置重试；`byot` 用自有响应类型反序列化，usage 字段缺失按未知，不因载荷不全让整块回退（§8.3） |
 | HTTP 传输 | `reqwest 0.13`（`rustls` + `socks`） | 构造带显式代理的 Client；client 级不设超时，总时限由自有计时器执行 |
 | TUI 框架 | `ratatui 0.30`（crossterm 0.29 后端） | 阅读器渲染与键盘/鼠标/resize 事件；`Paragraph::line_count` 需 `unstable-rendered-line-info` feature 或自算折行高度 |
-| Markdown 解析 | `pulldown-cmark 0.13` + `tui-markdown 0.3.13` | CommonMark 解析与 ratatui `Text` 桥接；与 ratatui 版本不合时照其思路自写渲染层，允许清单仅七种结构 |
+| Markdown 解析 | `pulldown-cmark 0.13`（自写 ratatui `Text` 渲染层） | CommonMark 解析，允许清单仅七种结构；渲染桥接照 tui-markdown 思路自写，兼容 ratatui 0.30 |
 | 并发 | `tokio 1`（`rt-multi-thread`）+ `futures 0.3` | `buffered(concurrency)` 同时给出在途上限与按块序产出 |
 | 配置 | `toml` + `serde` + `serde_ignored` | 未知键告警；逐键校验由契约代码负责 |
 | JSON | `serde_json` | 流式响应帧与请求体 |
@@ -949,7 +949,7 @@ Alpine 不做差分：其 `man` 来自 mandoc，契约与 GNU man-db 不同。
 | pty 测试 | `portable-pty`（dev-dependency） | 跨平台开 pty、设 winsize |
 | 许可审计 | `cargo-deny` | 拒绝 GPL/AGPL/SSPL，与 MIT 分发一致 |
 
-版本策略：提交 `Cargo.lock`；`rust-version = "1.88"` + edition 2024（ratatui 0.30 的 MSRV）；CI 跑 `cargo-deny check licenses advisories`。`async-openai` 锁 `0.43.x`，升级是显式动作；`middleware` feature 只用于安装无重试的 `ReqwestService`。`max_tokens` 字段在 0.43 标注 deprecated，按契约使用时加 `#[allow(deprecated)]`，线格式仍是 `max_tokens`。`rustls` 默认加密后端为 `aws-lc-rs`，需要 C 编译；`cargo-deny` 允许清单包含 ISC。ratatui、crossterm、pulldown-cmark、tui-markdown 均 MIT（crossterm 为 MIT/Apache-2.0 双许可）。
+版本策略：提交 `Cargo.lock`；`rust-version = "1.88"` + edition 2024（ratatui 0.30 的 MSRV）；CI 跑 `cargo-deny check licenses advisories`。`async-openai` 锁 `0.43.x`，升级是显式动作；`middleware` feature 只用于安装无重试的 `ReqwestService`，`byot` 让流式响应走自有类型反序列化。`max_tokens` 字段在 0.43 标注 deprecated，按契约使用时加 `#[allow(deprecated)]`，线格式仍是 `max_tokens`。`rustls` 默认加密后端为 `aws-lc-rs`，需要 C 编译；`cargo-deny` 允许清单包含 ISC。ratatui、crossterm、pulldown-cmark 均 MIT（crossterm 为 MIT/Apache-2.0 双许可）。
 
 ## 15. 已知限制
 

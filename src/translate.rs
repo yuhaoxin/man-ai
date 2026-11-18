@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::stream;
 
-use crate::backend::{Backend, Completion, Failure, Reason, Usage};
+use crate::backend::{Backend, Completion, Failure, Reason};
 use crate::blocks::{Block, SplitPage};
 use crate::cache::{self, Cache, KeyParts};
 use crate::language::Language;
+use crate::metrics::Measurement;
 use crate::output::Out;
 use crate::prompt;
 use crate::signals::CancelWatch;
@@ -80,9 +81,8 @@ struct BlockResult {
     block: Block,
     translation: Option<String>,
     failure: Option<Failure>,
-    /// 被采用请求的 usage 与生成窗口（§8.3）；失败与未尝试为 `None`。
-    usage: Option<Usage>,
-    window: Option<Duration>,
+    /// 被采用请求的测量记录（§8.3）；失败与未尝试为 `None`。
+    measurement: Option<Measurement>,
 }
 
 impl BlockResult {
@@ -91,8 +91,7 @@ impl BlockResult {
             block,
             translation: None,
             failure: None,
-            usage: None,
-            window: None,
+            measurement: None,
         }
     }
 
@@ -101,8 +100,7 @@ impl BlockResult {
             block,
             translation: None,
             failure: Some(failure),
-            usage: None,
-            window: None,
+            measurement: None,
         }
     }
 }
@@ -145,6 +143,9 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                 pre: String::new(),
             };
             out.write_block(&whole, body.as_str())?;
+            /* 命中页的唯一一次处置已完成：冻结整页流逝时间（§8.3）。 */
+            out.settled();
+
             /* 状态行从接管起算，只显示流逝时间与 cache hit（§8.3）。 */
             out.cache_hit();
             let outcome = Outcome {
@@ -183,12 +184,11 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                     )
                     .await
                     {
-                        Ok((translation, usage, window)) => BlockResult {
+                        Ok((translation, measurement)) => BlockResult {
                             block,
                             translation: Some(translation),
                             failure: None,
-                            usage,
-                            window: Some(window),
+                            measurement: Some(measurement),
                         },
                         Err(failure) => {
                             /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
@@ -292,7 +292,8 @@ struct Writer<'a> {
     /// 直播块当前是否有内容在屏幕上；决定回退注记与空行补写。
     shown: bool,
     adopted: usize,
-    failures: Vec<Reason>,
+    /// (块序, 原因)；并列时按块序决胜（§8.4）。
+    failures: Vec<(usize, Reason)>,
     diagnosed: bool,
     deterministic: bool,
     /// 整页译文（全部采用才落盘，§9.3）。
@@ -303,9 +304,8 @@ impl Writer<'_> {
     fn handle(&mut self, event: Event) {
         match event {
             Event::Delta { index, chunk } => {
-                if let Some(text) = self.acc.get_mut(index) {
-                    text.push_str(&chunk);
-                }
+                // index 由 worker 的 enumerate 产出，恒小于 acc 长度。
+                self.acc[index].push_str(&chunk);
                 if index == self.live {
                     let _ = self
                         .out
@@ -314,9 +314,7 @@ impl Writer<'_> {
                 }
             }
             Event::Reset { index } => {
-                if let Some(text) = self.acc.get_mut(index) {
-                    text.clear();
-                }
+                self.acc[index].clear();
                 if index == self.live {
                     /* 重试清空已显示内容，屏幕上只出现当前尝试的内容（§7.5）。 */
                     self.out.note("retrying");
@@ -327,10 +325,11 @@ impl Writer<'_> {
             Event::Finished { index, result } => {
                 if result.translation.is_some() {
                     /* out 随 usage 到达跳增、TPS 同时重算（§8.3）：事件先于落定。 */
+                    /* 采用路径必带测量记录：worker 的 Ok 分支恒置 Some。 */
                     self.out
-                        .metric(result.usage, result.window.unwrap_or_default());
+                        .metric(result.measurement.expect("采用块必有测量记录"));
                 }
-                self.account(&result);
+                self.account(index, &result);
                 self.pending[index] = Some(result);
                 /* 按序落定：直播块完成即推进，静默累积的块轮到后整块出现。 */
                 while self.pending.get(self.live).is_some_and(|slot| slot.is_some()) {
@@ -339,12 +338,16 @@ impl Writer<'_> {
                     self.live += 1;
                     self.shown = false;
                 }
+                /* 全部块落定即结果确定：冻结整页流逝时间（§8.3），不含缓存写入与尾行写出。 */
+                if self.live == self.acc.len() {
+                    self.out.settled();
+                }
             }
         }
     }
 
     /// 失败诊断与原因统计：每个进程最多一条诊断（§10.5）。
-    fn account(&mut self, result: &BlockResult) {
+    fn account(&mut self, index: usize, result: &BlockResult) {
         if let Some(failure) = &result.failure {
             if !self.diagnosed
                 && let Some(line) = &failure.diagnostic
@@ -353,7 +356,7 @@ impl Writer<'_> {
                 self.diagnosed = true;
             }
             if failure.reason != Reason::Interrupted {
-                self.failures.push(failure.reason);
+                self.failures.push((index, failure.reason));
                 if stops_submission(failure) {
                     self.deterministic = true;
                 }
@@ -388,7 +391,6 @@ impl Writer<'_> {
     }
 }
 
-
 /// 整页预转换文本：全部块 `pre` 按 `gap_before`/`tail_gap` 重组（§9.1 哈希对象）。
 fn pre_text(page: &SplitPage) -> String {
     let mut text = String::new();
@@ -409,16 +411,27 @@ fn stops_submission(failure: &Failure) -> bool {
     }
 }
 
-/// 出现次数最多的原因；并列时取最先出现的块。
-fn most_common(reasons: &[Reason]) -> Option<Reason> {
-    let mut best: Option<(Reason, usize)> = None;
-    for reason in reasons {
-        let count = reasons.iter().filter(|other| *other == reason).count();
-        if best.is_none_or(|(_, best_count)| count > best_count) {
-            best = Some((*reason, count));
+/// 出现次数最多的原因；并列时取页面序最先出现的失败块（§8.4）。
+fn most_common(failures: &[(usize, Reason)]) -> Option<Reason> {
+    let mut best: Option<(Reason, usize, usize)> = None; // (原因, 计数, 最小块序)
+    for &(_, reason) in failures {
+        let count = failures
+            .iter()
+            .filter(|(_, other)| *other == reason)
+            .count();
+        let first = failures
+            .iter()
+            .filter(|(_, other)| *other == reason)
+            .map(|(index, _)| *index)
+            .min()
+            .expect("reason 来自列表，过滤必非空");
+        if best.is_none_or(|(_, best_count, best_first)| {
+            count > best_count || (count == best_count && first < best_first)
+        }) {
+            best = Some((reason, count, first));
         }
     }
-    best.map(|(reason, _)| reason)
+    best.map(|(reason, _, _)| reason)
 }
 
 enum Verdict {
@@ -429,7 +442,7 @@ enum Verdict {
 /// 一块的完整尝试：最多重试一次，重试前等 500ms 并清空已显示内容（§7.5）。
 ///
 /// 确定性失败之后不再发起重试；翻译期间的 Ctrl-C 直接放弃该块。
-/// 返回译文与被采用请求的 usage 及其生成窗口。
+/// 返回译文与被采用请求的测量记录（usage 与生成窗口）。
 async fn translate_block(
     backend: &Backend,
     system: &str,
@@ -438,7 +451,7 @@ async fn translate_block(
     events: &tokio::sync::mpsc::UnboundedSender<Event>,
     stop: &AtomicBool,
     cancel: &CancelWatch,
-) -> Result<(String, Option<Usage>, Duration), Failure> {
+) -> Result<(String, Measurement), Failure> {
     let mut retried = false;
     loop {
         if cancel.triggered() {
@@ -456,7 +469,7 @@ async fn translate_block(
         let window = sent.elapsed();
         if let Some(result) = outcome {
             return match result {
-                Ok((text, usage)) => Ok((text, usage, window)),
+                Ok((text, usage)) => Ok((text, Measurement { usage, window })),
                 Err(failure) => {
                     if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
                         retried = true;
@@ -501,21 +514,18 @@ async fn post(
     }
 }
 
-/// §7.3 返回加工：剥掉首尾纯空行；行内与行尾空格保留（可能是排版）。
-fn postprocess(raw: &str) -> String {
-    strip_blank_edges(raw)
-}
-
-/// 剥掉首尾只含空白的行；中间的行原样保留。
+/// §7.3 返回加工：剥掉首尾纯空行；行内与行尾空格保留（可能是排版），
+/// 中间的空行原样保留。
 fn strip_blank_edges(text: &str) -> String {
     let lines = lines_with_endings(text);
     let Some(first) = lines.iter().position(|line| !is_blank_line(content(line))) else {
         return String::new();
     };
+    // first 存在即非空白行存在，rposition 必命中同一行。
     let last = lines
         .iter()
         .rposition(|line| !is_blank_line(content(line)))
-        .unwrap_or(first);
+        .expect("first 存在时 last 必存在");
     lines[first..=last].concat()
 }
 
@@ -547,7 +557,7 @@ fn evaluate(completion: &Completion) -> Verdict {
     if !completion.stopped {
         return Verdict::Rejected;
     }
-    let text = postprocess(&completion.content);
+    let text = strip_blank_edges(&completion.content);
     if text.trim().is_empty() {
         return Verdict::Rejected;
     }
@@ -559,21 +569,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 原因统计取最多且并列取最早() {
+    fn 原因统计取最多且并列取页面序最先() {
         use Reason::*;
         assert_eq!(most_common(&[]), None);
-        assert_eq!(most_common(&[Timeout]), Some(Timeout));
+        assert_eq!(most_common(&[(0, Timeout)]), Some(Timeout));
         assert_eq!(
-            most_common(&[Timeout, BackendError, BackendError]),
+            most_common(&[(0, Timeout), (1, BackendError), (2, BackendError)]),
             Some(BackendError)
         );
         assert_eq!(
-            most_common(&[Timeout, BackendError, BackendError, Timeout]),
+            most_common(&[
+                (0, Timeout),
+                (1, BackendError),
+                (2, BackendError),
+                (3, Timeout)
+            ]),
             Some(Timeout)
         );
+        // 并列时取页面序最先出现的失败块（§8.4），与完成事件到达序无关。
         assert_eq!(
-            most_common(&[BackendError, Timeout, Timeout, BackendError]),
+            most_common(&[(2, Timeout), (0, BackendError)]),
             Some(BackendError)
+        );
+        assert_eq!(
+            most_common(&[(5, BackendError), (2, Timeout)]),
+            Some(Timeout)
         );
     }
 
@@ -621,11 +641,11 @@ mod tests {
 
     #[test]
     fn 返回加工只剥首尾纯空行() {
-        assert_eq!(postprocess("\n\n  x  \n\n"), "  x  \n");
+        assert_eq!(strip_blank_edges("\n\n  x  \n\n"), "  x  \n");
         // 行内与行尾空格保留；中间空行保留；整块空白归零。
-        assert_eq!(postprocess("a\n\n \nb \n"), "a\n\n \nb \n");
-        assert_eq!(postprocess("  \t\r\n"), "");
+        assert_eq!(strip_blank_edges("a\n\n \nb \n"), "a\n\n \nb \n");
+        assert_eq!(strip_blank_edges("  \t\r\n"), "");
         // 恰好是整块围栏时按字面保留，不剥围栏（§7.3）。
-        assert_eq!(postprocess("```\nls -l\n```\n"), "```\nls -l\n```\n");
+        assert_eq!(strip_blank_edges("```\nls -l\n```\n"), "```\nls -l\n```\n");
     }
 }
