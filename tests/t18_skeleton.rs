@@ -1,7 +1,7 @@
-//! CLI、薄壳模式、分页器模式与真 man 差分的集成测试。
+//! CLI、薄壳模式与真 man 差分的集成测试。
 //!
-//! 薄壳模式的判定依赖 stdin 是 TTY，分页器链依赖 stdout 是 TTY，两者都只能
-//! 在 pty 下观察；pty 里的 `sh -c` 让需要方向的一端接管道。
+//! 薄壳模式的判定依赖 stdin 是 TTY，只能在 pty 下观察；pty 里的 `sh -c`
+//! 让需要方向的一端接管道。
 
 mod common;
 
@@ -9,36 +9,10 @@ use std::fs;
 
 use common::{
     BIN, RealMan, TempDir, assert_bytes_eq, record_value, recorded_args, recording_man, run_pipe,
-    run_pty_command, write_script,
+    run_pty_command,
 };
 
-// ---------------------------------------------------------------- 小工具
-
-/// pty 会把 `\n` 写成 `\r\n`，比较文本前统一掉。
-fn pty_text(output: &[u8]) -> String {
-    String::from_utf8_lossy(output).replace("\r\n", "\n")
-}
-
-struct PtyOut {
-    output: Vec<u8>,
-    code: i32,
-}
-
-// ---------------------------------------------------------------- 假 man / 假分页器
-
-/// 假内层分页器：记录 argv，原样输出 stdin，按给定退出码退出。
-fn fake_pager(dir: &TempDir, name: &str, exit_code: i32) -> std::path::PathBuf {
-    let argv_file = dir.file(&format!("{name}-argv.txt"));
-    let script = dir.file(name);
-    write_script(
-        &script,
-        &format!(
-            "#!/bin/sh\nprintf '%s' \"$*\" > '{argv}'\ncat\nexit {exit_code}\n",
-            argv = argv_file.display()
-        ),
-    );
-    script
-}
+// ---------------------------------------------------------------- 假 man
 
 struct ShellRun {
     pty: Vec<u8>,
@@ -86,7 +60,8 @@ fn help_打印用法与五个自有参数() {
     ] {
         assert!(text.contains(own), "帮助里缺少 {own}");
     }
-    for key in ["MANPAGER"] {
+    {
+        let key = "MANPAGER";
         assert!(text.contains(key), "帮助里缺少 {key}");
     }
     assert!(
@@ -233,7 +208,6 @@ fn 薄壳翻译开关最右生效并附加() {
         "man-ai --no-translate"
     );
 }
-
 
 #[test]
 fn 双破折号之后的自有参数照原样交给_man() {

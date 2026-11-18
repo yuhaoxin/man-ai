@@ -20,7 +20,11 @@ fn 非_tty_k_退出二且不起_man() {
     recording_man(&dir, 0);
     let run = run_shell_capture(&dir, &["-k", "list"], &[("PATH", &path_with(&dir))]);
     assert_eq!(run.code, 2);
-    assert!(run.output.is_empty(), "{}", String::from_utf8_lossy(&run.output));
+    assert!(
+        run.output.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.output)
+    );
     assert_eq!(run.stderr, K_LINE);
     assert!(!dir.file("man-record.txt").exists(), "不应执行 man");
 }
@@ -110,5 +114,3 @@ fn 让路与透传优先于_kf() {
     let record = fs::read_to_string(dir.file("man-record.txt")).unwrap();
     assert!(record.contains("args=-k -w ls"), "{record}");
 }
-
-

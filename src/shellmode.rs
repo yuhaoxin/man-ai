@@ -113,15 +113,14 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
         cache: &cache,
         concurrency: config.concurrency,
     };
-    if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out)) {
-        if outcome.all_failed() {
-            if let Some(reason) = outcome.reason {
-                eprintln!(
-                    "man-ai: translation failed ({}), showing the original below",
-                    reason.as_str()
-                );
-            }
-        }
+    if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out))
+        && outcome.all_failed()
+        && let Some(reason) = outcome.reason
+    {
+        eprintln!(
+            "man-ai: translation failed ({}), showing the original below",
+            reason.as_str()
+        );
     }
     let _ = out.finish();
     code

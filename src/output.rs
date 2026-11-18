@@ -174,7 +174,6 @@ impl Out {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +240,10 @@ mod tests {
             received,
             vec![
                 Message::Header("── man-ai: translation (zh-CN) ──".to_string()),
-                Message::Block { gap: 0, body: "译\n".to_string() },
+                Message::Block {
+                    gap: 0,
+                    body: "译\n".to_string()
+                },
                 Message::Tail("── man-ai: translated (zh-CN) ──".to_string()),
                 Message::Done,
             ]

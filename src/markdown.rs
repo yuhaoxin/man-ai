@@ -76,7 +76,10 @@ impl Renderer {
             // 清单外结构的降级：按普通段落处理。
             Tag::BlockQuote(_) | Tag::HtmlBlock | Tag::FootnoteDefinition(_) => self.block(),
             Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => self.block(),
-            Tag::Link { .. } | Tag::Image { .. } | Tag::Strikethrough | Tag::Superscript
+            Tag::Link { .. }
+            | Tag::Image { .. }
+            | Tag::Strikethrough
+            | Tag::Superscript
             | Tag::Subscript => {}
             Tag::DefinitionList | Tag::DefinitionListTitle | Tag::DefinitionListDefinition => {}
             Tag::MetadataBlock(_) => {}
@@ -108,8 +111,12 @@ impl Renderer {
             }
             TagEnd::Emphasis => self.italic = false,
             TagEnd::Strong => self.bold = false,
-            TagEnd::Link | TagEnd::Image | TagEnd::Strikethrough | TagEnd::Superscript
-            | TagEnd::Subscript | TagEnd::MetadataBlock(_) => {}
+            TagEnd::Link
+            | TagEnd::Image
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript
+            | TagEnd::MetadataBlock(_) => {}
         }
     }
 
@@ -237,7 +244,10 @@ mod tests {
 
     /// 一行所有 Span 的拼接文本。
     fn plain(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.to_string()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
     }
 
     fn render(src: &str) -> Vec<String> {
@@ -248,7 +258,12 @@ mod tests {
     fn 标题加粗_正文分块() {
         let lines = render("# LS(1)\n\nplain text");
         assert_eq!(lines, vec!["LS(1)", "", "plain text"]);
-        assert!(to_lines("# LS(1)")[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            to_lines("# LS(1)")[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]

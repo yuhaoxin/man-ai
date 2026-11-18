@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use common::{
     FakeModel, Reply, TempDir, cache_env, completion, entries, env_refs, error_body, model_config,
-    model_config_with, run_pager_tty, run_pipe, text,
+    model_config_with, run_pipe, text,
 };
 
 const LANG: &str = "zh-CN";
@@ -89,9 +89,9 @@ fn 非_utf8_块有损解码后照常请求并落缓存() {
 #[test]
 fn 命中零请求且阅读器输出一致() {
     let dir = TempDir::new("t22-order");
-    let model = FakeModel::start(vec![
-        Reply::Ok(completion("t1\n", "stop")),
-        Reply::Ok(completion("t2\n", "stop")),
+    let model = FakeModel::start_by_content(vec![
+        ("a\n".to_string(), Reply::Ok(completion("t1\n", "stop"))),
+        ("b\n".to_string(), Reply::Ok(completion("t2\n", "stop"))),
     ]);
     dir.write_config(&model_config_with(&model, 2, ""));
     let env = cache_env(&dir);
@@ -112,11 +112,19 @@ fn 命中零请求且阅读器输出一致() {
     let second = run(&dir);
     assert_eq!(model.count(), 2, "命中不应再发请求");
     // 阅读器输出含页首行与尾行；elapsed 各不相同，不比较时间行。
+    // ratatui 的帧 diff 跳过空格，断言前去掉空格。
     for text in [first.text(), second.text()] {
-        assert!(text.contains("── man-ai: translation (Simplified Chinese) ──"));
-        assert!(text.contains("── man-ai: translated (Simplified Chinese) ──"));
-        assert!(text.contains("t1"));
-        assert!(text.contains("t2"));
+        let compact = common::compact(&text);
+        assert!(
+            compact.contains("──man-ai:translation(SimplifiedChinese)──"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("──man-ai:translated(SimplifiedChinese)──"),
+            "{compact}"
+        );
+        assert!(compact.contains("t1"), "{compact}");
+        assert!(compact.contains("t2"), "{compact}");
     }
     assert_eq!(first.code, 0);
     assert_eq!(second.code, 0);

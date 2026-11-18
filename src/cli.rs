@@ -262,7 +262,6 @@ mod tests {
         ] {
             assert_eq!(scan_entry(&args(&argv)).kf, None, "{argv:?} 不应命中 -k/-f");
         }
-
     }
 
     #[test]

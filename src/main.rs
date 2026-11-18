@@ -144,7 +144,14 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
         }
     };
     if io::stdout().is_terminal() {
-        translate_to_reader(page, &input, lang, backend, cache, loaded.config.concurrency)
+        translate_to_reader(
+            page,
+            &input,
+            lang,
+            backend,
+            cache,
+            loaded.config.concurrency,
+        )
     } else {
         let ctx = PipelineCtx {
             lang: &lang,
@@ -168,7 +175,7 @@ fn translate_to_reader(
     concurrency: usize,
 ) -> i32 {
     // 阅读器先接管终端；初始化失败时跳过翻译，预转换原文直写 stdout（§5.4）。
-    let guard = match reader::takeover() {
+    let mut guard = match reader::takeover() {
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("man-ai: terminal unavailable ({error}); showing the original");
@@ -180,7 +187,6 @@ fn translate_to_reader(
     let (cancel_trigger, cancel) = signals::cancel_pair();
     let mut out = output::Out::channel(sender, cancel);
     thread::spawn(move || {
-        eprintln!("[dbg] worker start");
         let ctx = PipelineCtx {
             lang: &lang,
             backend: backend.as_ref(),
@@ -191,7 +197,7 @@ fn translate_to_reader(
             let _ = out.finish();
         }
     });
-    let exit = reader::serve_translating(guard, receiver, cancel_trigger);
+    let exit = reader::serve_translating(&mut guard, receiver, cancel_trigger);
     for line in &exit.diagnostics {
         eprintln!("man-ai: {line}");
     }
@@ -205,13 +211,14 @@ fn translate_to_stdout(page: blocks::SplitPage, ctx: PipelineCtx<'_>) -> i32 {
         Ok(outcome) => outcome,
         Err(_) => return 0,
     };
-    if outcome.all_failed() && !out.broken() {
-        if let Some(reason) = outcome.reason {
-            eprintln!(
-                "man-ai: translation failed ({}), showing the original below",
-                reason.as_str()
-            );
-        }
+    if outcome.all_failed()
+        && !out.broken()
+        && let Some(reason) = outcome.reason
+    {
+        eprintln!(
+            "man-ai: translation failed ({}), showing the original below",
+            reason.as_str()
+        );
     }
     out.finish().unwrap_or(0)
 }
@@ -224,8 +231,8 @@ fn output_original(input: &[u8]) -> i32 {
     }
     let original = blocks::preconvert(input);
     match reader::takeover() {
-        Ok(guard) => {
-            let exit = reader::serve_static(guard, original);
+        Ok(mut guard) => {
+            let exit = reader::serve_static(&mut guard, original);
             for line in &exit.diagnostics {
                 eprintln!("man-ai: {line}");
             }

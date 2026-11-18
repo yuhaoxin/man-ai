@@ -5,9 +5,7 @@
 
 mod common;
 
-use common::{
-    FakeModel, Reply, TempDir, completion, error_body, model_config, run_pipe, text,
-};
+use common::{FakeModel, Reply, TempDir, completion, error_body, model_config, run_pipe, text};
 
 const LANG: &str = "zh-CN";
 
@@ -38,7 +36,11 @@ fn 可重试失败回退单块() {
     let run = run_pipe(&dir, &["--translate", "--lang", LANG], b"a\n\nb\n", &[]);
     // 回退块是预转换原文。
     assert_eq!(text(&run.stdout), "甲\n\nb\n");
-    assert!(text(&run.stderr).contains("backend returned HTTP 500"), "{}", text(&run.stderr));
+    assert!(
+        text(&run.stderr).contains("backend returned HTTP 500"),
+        "{}",
+        text(&run.stderr)
+    );
     assert_eq!(model.count(), 3);
 }
 
@@ -50,7 +52,12 @@ fn 确定性失败停止提交后续块() {
     ]);
     let dir = TempDir::new("pipe-deterministic");
     dir.write_config(&model_config(&model, ""));
-    let run = run_pipe(&dir, &["--translate", "--lang", LANG], b"a\n\nb\n\nc\n", &[]);
+    let run = run_pipe(
+        &dir,
+        &["--translate", "--lang", LANG],
+        b"a\n\nb\n\nc\n",
+        &[],
+    );
     // 停止提交后其余块写预转换原文，仍按序完整写出。
     assert_eq!(text(&run.stdout), "甲\n\nb\n\nc\n");
     // 第三块没有再发请求。
@@ -76,7 +83,8 @@ fn 未配置后端全部原文并提示整页失败() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("man-ai: translation failed (not configured), showing the original below\n"),
+        stderr
+            .contains("man-ai: translation failed (not configured), showing the original below\n"),
         "{stderr}"
     );
 }
@@ -102,11 +110,19 @@ fn 非_utf8_块有损解码后照常翻译() {
     ]);
     let dir = TempDir::new("pipe-non-utf8");
     dir.write_config(&model_config(&model, ""));
-    let run = run_pipe(&dir, &["--translate", "--lang", LANG], b"ok\n\n\xff\xfe\n", &[]);
+    let run = run_pipe(
+        &dir,
+        &["--translate", "--lang", LANG],
+        b"ok\n\n\xff\xfe\n",
+        &[],
+    );
     assert_eq!(model.count(), 2);
     // 第二块按 U+FFFD 有损解码后送模型，也计入采用。
     let requests = model.requests();
-    assert_eq!(requests[1].body["messages"][1]["content"], "\u{fffd}\u{fffd}\n");
+    assert_eq!(
+        requests[1].body["messages"][1]["content"],
+        "\u{fffd}\u{fffd}\n"
+    );
     assert_eq!(text(&run.stdout), "甲\n\n乙\n");
 }
 
@@ -160,7 +176,8 @@ fn 超时只回退该块不重试() {
     assert_eq!(text(&run.stdout), "a\n\nb\n");
     assert_eq!(model.count(), 2);
     assert!(
-        text(&run.stderr).contains("man-ai: translation failed (timeout), showing the original below"),
+        text(&run.stderr)
+            .contains("man-ai: translation failed (timeout), showing the original below"),
         "{}",
         text(&run.stderr)
     );

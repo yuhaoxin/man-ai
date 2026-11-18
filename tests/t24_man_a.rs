@@ -1,19 +1,20 @@
 //! `man -a` 的按页集成验收（§3.2、§13.1）。
 //!
-//! `-a` 完全交给平台 man：每个匹配页各起一次 man-ai，各自判定 TTY、各自翻译与缓存、
-//! 各自写页首行。假 man 复现「每页各起一次 MANPAGER」，不用真 man 的 whatis 数据库。
+//! `-a` 完全交给平台 man：每个匹配页各起一次 man-ai，各自判定 TTY、各自翻译与
+//! 缓存、各自进阅读器。假 man 复现「每页各起一次 MANPAGER」，不用真 man 的
+//! whatis 数据库。
 
 mod common;
 
 use std::fs;
+use std::time::Duration;
 
 use common::{
-    FakeModel, Reply, TempDir, completion, model_config, run_shell_tty, text, write_script,
+    FakeModel, Reply, TempDir, compact, completion, model_config, run_pty_driven, wait_seen,
+    write_script,
 };
 
 const LANG: &str = "zh-CN";
-const HEADER: &str = "── man-ai: translation (Simplified Chinese) ──\n\n";
-const TAIL: &str = "── man-ai: translated (Simplified Chinese) ──\n";
 
 fn page_dir(dir: &TempDir) -> std::path::PathBuf {
     let bin = dir.file("bin");
@@ -68,56 +69,62 @@ fn man_a_每页各自翻译与缓存且与单页一致() {
     dir.write_config(&model_config(&model, ""));
     let path = format!("{}:/usr/bin:/bin", bin.display());
     let cache = dir.file("cache");
-    let cache = cache.to_str().unwrap();
-
-    let expected_page = |body: &str| format!("{HEADER}{body}\n{TAIL}");
-    let expected = expected_page("t-alpha\n") + &expected_page("t-beta\n");
-
-    let first = run_shell_tty(
-        &dir,
-        &["--lang", LANG, "-a", "fixture"],
-        &[
-            ("PATH", &path),
-            ("MAN_AI_PAGER", "cat"),
-            ("XDG_CACHE_HOME", cache),
-        ],
+    let env = vec![
+        ("PATH", path),
+        ("XDG_CACHE_HOME", cache.to_str().unwrap().to_string()),
+    ];
+    let stderr_file = dir.file("stderr.txt");
+    let script = format!(
+        "exec '{}' --lang {LANG} -a fixture 2>'{}'",
+        common::BIN,
+        stderr_file.display()
     );
+
+    // 每页的阅读器各等尾行 + 正文，然后按 q。
+    let run = || {
+        run_pty_driven(
+            &dir,
+            &script,
+            &stderr_file,
+            &env,
+            "── man-ai: translation (Simplified Chinese) ──",
+            move |_pid, writer, seen| {
+                wait_seen(
+                    seen,
+                    "t-alpha──man-ai:translated(SimplifiedChinese)──",
+                    Duration::from_secs(30),
+                );
+                let _ = writer.write_all(b"q");
+                wait_seen(
+                    seen,
+                    "t-beta──man-ai:translated(SimplifiedChinese)──",
+                    Duration::from_secs(30),
+                );
+                let _ = writer.write_all(b"q");
+            },
+        )
+    };
+
+    let first = run();
     assert_eq!(first.code, 0, "{}", first.stderr);
-    assert_eq!(text(&first.output), expected);
+    let text = compact(&first.text());
+    // 两页按序各进一次阅读器。
+    assert!(text.contains("t-alpha"), "{text}");
+    assert!(text.contains("t-beta"), "{text}");
+    assert!(
+        text.find("t-alpha").unwrap() < text.find("t-beta").unwrap(),
+        "页序应与 man 的输出一致：{text}"
+    );
     assert_eq!(fs::read_to_string(&record).unwrap(), "-a fixture");
     assert_eq!(model.count(), 2, "每页一次请求，各页独立");
-    // 每页各写一次进度行。
-    assert_eq!(
-        first
-            .stderr
-            .matches("man-ai: translating (Simplified Chinese)…\n")
-            .count(),
-        2,
-        "{}",
-        first.stderr
-    );
+    assert!(first.stderr.is_empty(), "{}", first.stderr);
 
     // 第二次：两页都命中缓存，请求数不增。
-    let second = run_shell_tty(
-        &dir,
-        &["--lang", LANG, "-a", "fixture"],
-        &[
-            ("PATH", &path),
-            ("MAN_AI_PAGER", "cat"),
-            ("XDG_CACHE_HOME", cache),
-        ],
-    );
+    let second = run();
     assert_eq!(second.code, 0, "{}", second.stderr);
-    assert_eq!(text(&second.output), expected);
+    let text = compact(&second.text());
+    assert!(text.contains("t-alpha"), "{text}");
+    assert!(text.contains("t-beta"), "{text}");
     assert_eq!(model.count(), 2, "命中缓存后不再请求");
-    // 分页器启动前的进度行与是否命中缓存无关，每页各一次。
-    assert_eq!(
-        second
-            .stderr
-            .matches("man-ai: translating (Simplified Chinese)…\n")
-            .count(),
-        2,
-        "{}",
-        second.stderr
-    );
+    assert!(second.stderr.is_empty(), "{}", second.stderr);
 }

@@ -16,7 +16,10 @@ fn styled_page() -> Vec<u8> {
 
 fn styled_script() -> Vec<(String, Reply)> {
     vec![
-        ("LS(1)\n".to_string(), Reply::Ok(completion("LS(1)\n", "stop"))),
+        (
+            "LS(1)\n".to_string(),
+            Reply::Ok(completion("LS(1)\n", "stop")),
+        ),
         (
             "**ls** - list\n".to_string(),
             Reply::Ok(completion("**ls** - 列出\n", "stop")),
@@ -36,7 +39,10 @@ fn 非_tty_translate_输出为_markdown_源文且请求送预转换文本() {
     let run = run_pipe(&dir, &["--translate", "--lang", LANG], &styled_page(), &[]);
     assert_eq!(run.code, 0);
     // stdout 只有纯 Markdown 源文：无 ANSI 序列、无退格、无页首/尾行。
-    assert_eq!(text(&run.stdout), "LS(1)\n\n**ls** - 列出\n\n*用途* - 提示\n");
+    assert_eq!(
+        text(&run.stdout),
+        "LS(1)\n\n**ls** - 列出\n\n*用途* - 提示\n"
+    );
     assert!(run.stderr.is_empty(), "{}", text(&run.stderr));
 
     // 块数与请求数一致；每块的用户消息就是预转换文本。

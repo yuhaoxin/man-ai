@@ -10,9 +10,9 @@ use std::io;
 
 use tokio::sync::watch;
 
-use signal_hook::low_level;
-use signal_hook::consts::{SIGHUP, SIGTERM};
 use signal_hook::SigId;
+use signal_hook::consts::{SIGHUP, SIGTERM};
+use signal_hook::low_level;
 
 /// Ctrl-C 取消通道：阅读器持触发端，翻译持观察端。
 pub fn cancel_pair() -> (CancelTrigger, CancelWatch) {
@@ -121,7 +121,8 @@ mod tests {
 
         let (trigger, mut watch) = cancel_pair();
         drop(trigger);
-        let polled = tokio::time::timeout(std::time::Duration::from_millis(50), watch.cancelled()).await;
+        let polled =
+            tokio::time::timeout(std::time::Duration::from_millis(50), watch.cancelled()).await;
         assert!(polled.is_err());
     }
 }

@@ -117,12 +117,12 @@ pub fn preconvert(raw: &[u8]) -> String {
             i += 1;
             continue;
         }
-        if chars.get(i + 1) == Some(&'\x08') {
-            if let Some((shown, style)) = overstrike(&chars, i, &mut i) {
-                set(&mut out, &mut open, sgr.union(style));
-                out.push(shown);
-                continue;
-            }
+        if chars.get(i + 1) == Some(&'\x08')
+            && let Some((shown, style)) = overstrike(&chars, i, &mut i)
+        {
+            set(&mut out, &mut open, sgr.union(style));
+            out.push(shown);
+            continue;
         }
         set(&mut out, &mut open, sgr);
         out.push(c);
@@ -318,8 +318,14 @@ mod tests {
 
     #[test]
     fn 预转换_sgr_粗体与下划线() {
-        assert_eq!(preconvert(b"\x1b[1mbold\x1b[0m plain\n"), "**bold** plain\n");
-        assert_eq!(preconvert(b"\x1b[4munder\x1b[0m plain\n"), "*under* plain\n");
+        assert_eq!(
+            preconvert(b"\x1b[1mbold\x1b[0m plain\n"),
+            "**bold** plain\n"
+        );
+        assert_eq!(
+            preconvert(b"\x1b[4munder\x1b[0m plain\n"),
+            "*under* plain\n"
+        );
         // 22/24 是粗体/下划线的单独关闭。
         assert_eq!(preconvert(b"\x1b[1mb\x1b[22mc\n"), "**b**c\n");
         assert_eq!(preconvert(b"\x1b[4mu\x1b[24mv\n"), "*u*v\n");
@@ -341,7 +347,10 @@ mod tests {
         assert_eq!(preconvert(b"u\x08_d\x08_e\x08_r\x08_\n"), "*uder*\n");
         assert_eq!(preconvert(b"_\x08q tail\n"), "*q* tail\n");
         // 三重叠加只显示一次。
-        assert_eq!(preconvert(b"k\x08k\x08ke\x08e\x08ey\x08y\x08y\n"), "**key**\n");
+        assert_eq!(
+            preconvert(b"k\x08k\x08ke\x08e\x08ey\x08y\x08y\n"),
+            "**key**\n"
+        );
     }
 
     #[test]
@@ -351,12 +360,18 @@ mod tests {
         assert_eq!(preconvert(b"a\x1b(Bb\x1b7c\n"), "abc\n");
         assert_eq!(preconvert(b"col1\tcol2\n"), "col1\tcol2\n");
         // 文本逐字节保留。
-        assert_eq!(preconvert(b"plain  spaced --  dashes\x08\n"), "plain  spaced --  dashes\n");
+        assert_eq!(
+            preconvert(b"plain  spaced --  dashes\x08\n"),
+            "plain  spaced --  dashes\n"
+        );
     }
 
     #[test]
     fn 预转换_sgr_与退格叠加混排() {
-        assert_eq!(preconvert(b"\x1b[1mB\x08Bold\x1b[0m rest\n"), "**Bold** rest\n");
+        assert_eq!(
+            preconvert(b"\x1b[1mB\x08Bold\x1b[0m rest\n"),
+            "**Bold** rest\n"
+        );
         // SGR 粗体里的下划线叠加：粗体跨度内嵌下划线。
         assert_eq!(preconvert(b"\x1b[1ma\x08_b\x1b[0m\n"), "***a*b**\n");
     }

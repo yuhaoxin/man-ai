@@ -58,7 +58,6 @@ impl Outcome {
 
 /// 在独立运行时上跑完一页。
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    eprintln!("[dbg] block_on enter");
     tokio::runtime::Runtime::new()
         .expect("tokio runtime")
         .block_on(future)
@@ -93,9 +92,7 @@ impl BlockResult {
 ///
 /// 每块送预转换文本，失败块写预转换原文（§6.3）。
 pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> io::Result<Outcome> {
-    eprintln!("[dbg] run_page start");
     out.write_header(ctx.lang.display())?;
-    eprintln!("[dbg] header sent");
     let system = prompt::page(ctx.lang);
     let total = page.blocks.len();
     let stop = AtomicBool::new(false);
@@ -124,19 +121,19 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         .map(move |block| {
             let cancel = cancel.clone();
             async move {
-            /* 确定性失败或翻译期间的 Ctrl-C 之后，未开始的块不再发请求。 */
-            if stop_ref.load(Ordering::Relaxed) || cancel.triggered() {
-                return BlockResult::original(block);
-            }
-            let Some(backend) = backend else {
-                stop_ref.store(true, Ordering::Relaxed);
-                return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
-            };
-            /* 命中直接采用，不发请求、不重新校验（§9.3）。 */
-            if let Some(parts) = parts {
-                if let Some(hit) = cache
-                    .get(Form::Page, &parts, &block.raw)
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                /* 确定性失败或翻译期间的 Ctrl-C 之后，未开始的块不再发请求。 */
+                if stop_ref.load(Ordering::Relaxed) || cancel.triggered() {
+                    return BlockResult::original(block);
+                }
+                let Some(backend) = backend else {
+                    stop_ref.store(true, Ordering::Relaxed);
+                    return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
+                };
+                /* 命中直接采用，不发请求、不重新校验（§9.3）。 */
+                if let Some(parts) = parts
+                    && let Some(hit) = cache
+                        .get(Form::Page, &parts, &block.raw)
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
                 {
                     return BlockResult {
                         block,
@@ -144,28 +141,27 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
                         failure: None,
                     };
                 }
-            }
-            match translate_block(backend, system, &block.pre, stop_ref, &cancel).await {
-                Ok(translation) => {
-                    /* 采用后立即写，与写出顺序无关（§9.3）。 */
-                    if let Some(parts) = parts {
-                        cache.put(Form::Page, &parts, &block.raw, translation.as_bytes());
+                match translate_block(backend, system, &block.pre, stop_ref, &cancel).await {
+                    Ok(translation) => {
+                        /* 采用后立即写，与写出顺序无关（§9.3）。 */
+                        if let Some(parts) = parts {
+                            cache.put(Form::Page, &parts, &block.raw, translation.as_bytes());
+                        }
+                        BlockResult {
+                            block,
+                            translation: Some(translation),
+                            failure: None,
+                        }
                     }
-                    BlockResult {
-                        block,
-                        translation: Some(translation),
-                        failure: None,
+                    Err(failure) => {
+                        /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
+                        if stops_submission(&failure) {
+                            stop_ref.store(true, Ordering::Relaxed);
+                        }
+                        BlockResult::failed(block, failure)
                     }
                 }
-                Err(failure) => {
-                    /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
-                    if stops_submission(&failure) {
-                        stop_ref.store(true, Ordering::Relaxed);
-                    }
-                    BlockResult::failed(block, failure)
-                }
             }
-        }
         })
         .buffered(ctx.concurrency);
     futures::pin_mut!(results);
@@ -173,11 +169,11 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     while let Some(result) = results.next().await {
         if let Some(failure) = &result.failure {
             /* 每进程最多输出一条失败诊断，取第一个失败（§10.5）。 */
-            if let Some(line) = &failure.diagnostic {
-                if !diagnosed {
-                    out.diagnostic(line);
-                    diagnosed = true;
-                }
+            if let Some(line) = &failure.diagnostic
+                && !diagnosed
+            {
+                out.diagnostic(line);
+                diagnosed = true;
             }
             if failure.reason == Reason::Interrupted {
                 stop.store(true, Ordering::Relaxed);
