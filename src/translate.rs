@@ -1,9 +1,9 @@
-//! 翻译管线：按块序并发请求、重试状态机、回退（规格 §7、§8）。
+//! 翻译管线：按块序并发请求、重试状态机、直播写出（规格 §7、§8）。
 //!
-//! `buffered(concurrency)` 给出在途上限并保持产出顺序；重试在同一个槽位内完成。
-//! 写出顺序恒等块序：已完成的后续块留在内存等前序。回退与未完成块写预转换原文。
+//! worker 在 `buffered(concurrency)` 里发流式请求，把增量与完成事件发给
+//! 单一写出循环；写出循环维护按序前缀：直播块（第一个未完成的块）增量上屏，
+//! 后续块静默累积、轮到后整块出现。写出顺序恒等块序；失败与未完成块写预转换原文。
 
-use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::stream;
 
-use crate::backend::{Backend, Completion, Failure, Reason};
+use crate::backend::{Backend, Completion, Failure, Reason, Usage};
 use crate::blocks::{Block, SplitPage};
 use crate::cache::{self, Cache, KeyParts};
 use crate::language::Language;
@@ -19,8 +19,18 @@ use crate::output::Out;
 use crate::prompt;
 use crate::signals::CancelWatch;
 
-/// 重试前的固定等待（§7.7）。
+/// 重试前的固定等待（§7.5）。
 pub const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// worker 发给写出循环的事件；`index` 是块序。
+enum Event {
+    /// 新到的译文增量（§7.3 累积中的片段）。
+    Delta { index: usize, chunk: String },
+    /// 重试开始：清空该块已显示内容，从空直播重新开始（§7.5）。
+    Reset { index: usize },
+    /// 块处置完成：采用、回退或未尝试。
+    Finished { index: usize, result: BlockResult },
+}
 
 /// 一次翻译运行需要的上下文。
 #[derive(Clone, Copy)]
@@ -49,6 +59,9 @@ pub struct Outcome {
     pub deterministic: bool,
     /// 第一次 Ctrl-C 中断了翻译。
     pub interrupted: bool,
+    /// 被采用请求的 usage，按块序（§8.3 后续指标票的消费接口；
+    /// 失败与回退请求不计入）。
+    pub usages: Vec<Usage>,
 }
 
 impl Outcome {
@@ -70,6 +83,8 @@ struct BlockResult {
     block: Block,
     translation: Option<String>,
     failure: Option<Failure>,
+    /// 被采用请求的 usage；失败与未尝试为 `None`。
+    usage: Option<Usage>,
 }
 
 impl BlockResult {
@@ -78,6 +93,7 @@ impl BlockResult {
             block,
             translation: None,
             failure: None,
+            usage: None,
         }
     }
 
@@ -86,6 +102,7 @@ impl BlockResult {
             block,
             translation: None,
             failure: Some(failure),
+            usage: None,
         }
     }
 }
@@ -100,10 +117,6 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     let stop = AtomicBool::new(false);
     let cancel = out.cancel();
     let cancel_after = cancel.clone();
-    let mut adopted = 0;
-    let mut failures: Vec<Reason> = Vec::new();
-    let mut diagnosed = false;
-    let mut deterministic = false;
 
     let backend = ctx.backend;
     let cache = ctx.cache;
@@ -119,103 +132,132 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
     });
     // 整页缓存键：页名从预转换文本第一行页眉解析，哈希对象是整页预转换文本。
     let page_key = parts.and_then(|_| cache::PageKey::parse(pre_text(&page)));
+    // 块送进 worker 后页面即被消耗，先把空行数留出来给直播帧用。
+    let gaps: Vec<usize> = page.blocks.iter().map(|block| block.gap_before).collect();
 
     /* 整页缓存命中：剥注释行直出，零请求（§9.3）；--retranslate 跳过读取。 */
     if !ctx.retranslate
         && let (Some(parts), Some(key)) = (parts, page_key.as_ref())
-            && let Some(body) = cache.get_page(&parts, key) {
-                let whole = Block {
-                    gap_before: 0,
-                    raw: Vec::new(),
-                    pre: String::new(),
-                };
-                out.write_block(&whole, body.as_str())?;
-                let outcome = Outcome {
-                    adopted: total,
-                    total,
-                    reason: None,
-                    deterministic: false,
-                    interrupted: false,
-                };
-                if !out.broken() {
-                    out.write_tail(&outcome)?;
-                }
-                return Ok(outcome);
+        && let Some(body) = cache.get_page(&parts, key) {
+            let whole = Block {
+                gap_before: 0,
+                raw: Vec::new(),
+                pre: String::new(),
+            };
+            out.write_block(&whole, body.as_str())?;
+            let outcome = Outcome {
+                adopted: total,
+                total,
+                reason: None,
+                deterministic: false,
+                interrupted: false,
+                usages: Vec::new(),
+            };
+            if !out.broken() {
+                out.write_tail(&outcome)?;
             }
+            return Ok(outcome);
+        }
 
     let system = system.as_str();
     let stop_ref = &stop;
-    let results = stream::iter(page.blocks)
-        .map(move |block| {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let workers = stream::iter(page.blocks.into_iter().enumerate())
+        .map(move |(index, block)| {
+            let events = events_tx.clone();
             let cancel = cancel.clone();
             async move {
                 /* 确定性失败或翻译期间的 Ctrl-C 之后，未开始的块不再发请求。 */
-                if stop_ref.load(Ordering::Relaxed) || cancel.triggered() {
-                    return BlockResult::original(block);
-                }
-                let Some(backend) = backend else {
-                    stop_ref.store(true, Ordering::Relaxed);
-                    return BlockResult::failed(block, Failure::new(Reason::NotConfigured, false));
-                };
-                match translate_block(backend, system, &block.pre, stop_ref, &cancel).await {
-                    Ok(translation) => BlockResult {
-                        block,
-                        translation: Some(translation),
-                        failure: None,
-                    },
-                    Err(failure) => {
-                        /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
-                        if stops_submission(&failure) {
-                            stop_ref.store(true, Ordering::Relaxed);
+                let result = if stop_ref.load(Ordering::Relaxed) || cancel.triggered() {
+                    BlockResult::original(block)
+                } else if let Some(backend) = backend {
+                    match translate_block(
+                        backend,
+                        system,
+                        &block.pre,
+                        index,
+                        &events,
+                        stop_ref,
+                        &cancel,
+                    )
+                    .await
+                    {
+                        Ok((translation, usage)) => BlockResult {
+                            block,
+                            translation: Some(translation),
+                            failure: None,
+                            usage,
+                        },
+                        Err(failure) => {
+                            /* 在这里置位，才能赶在 `buffered` 拉起下一个 future 之前生效。 */
+                            if stops_submission(&failure) {
+                                stop_ref.store(true, Ordering::Relaxed);
+                            }
+                            BlockResult::failed(block, failure)
                         }
-                        BlockResult::failed(block, failure)
                     }
-                }
+                } else {
+                    stop_ref.store(true, Ordering::Relaxed);
+                    BlockResult::failed(block, Failure::new(Reason::NotConfigured, false))
+                };
+                let _ = events.send(Event::Finished { index, result });
             }
         })
         .buffered(ctx.concurrency);
-    futures::pin_mut!(results);
+    futures::pin_mut!(workers);
 
-    let mut body = String::new();
-    while let Some(result) = results.next().await {
-        if let Some(failure) = &result.failure {
-            /* 每进程最多输出一条失败诊断，取第一个失败（§10.5）。 */
-            if let Some(line) = &failure.diagnostic
-                && !diagnosed
-            {
-                out.diagnostic(line);
-                diagnosed = true;
+    let mut writer = Writer {
+        out,
+        gaps,
+        acc: vec![String::new(); total],
+        pending: (0..total).map(|_| None).collect(),
+        live: 0,
+        shown: false,
+        adopted: 0,
+        failures: Vec::new(),
+        diagnosed: false,
+        deterministic: false,
+        body: String::new(),
+        usages: Vec::new(),
+    };
+    let mut done_workers = 0;
+    loop {
+        if done_workers == total {
+            /* worker 已全部返回：收走队列里残留的事件后收尾。 */
+            match events_rx.try_recv() {
+                Ok(event) => writer.handle(event),
+                Err(_) => break,
             }
-            if failure.reason == Reason::Interrupted {
-                stop.store(true, Ordering::Relaxed);
-            } else {
-                failures.push(failure.reason);
-                if stops_submission(failure) {
-                    deterministic = true;
-                    stop.store(true, Ordering::Relaxed);
+        } else {
+            tokio::select! {
+                event = events_rx.recv() => {
+                    match event {
+                        Some(event) => writer.handle(event),
+                        None => break,
+                    }
+                }
+                _ = workers.next() => {
+                    done_workers += 1;
                 }
             }
         }
-        if result.translation.is_some() {
-            adopted += 1;
-        }
-        let text = match &result.translation {
-            Some(translation) => translation.as_str(),
-            None => result.block.pre.as_str(),
-        };
-        out.write_block(&result.block, text)?;
-        if let Some(translation) = &result.translation {
-            body.extend(std::iter::repeat_n('\n', result.block.gap_before));
-            body.push_str(translation);
-        }
         if let Some(line) = ctx.cache.take_warning() {
-            out.diagnostic(&line);
+            writer.out.diagnostic(&line);
         }
         /* 阅读器退出（q）：丢弃在途请求、停止写入（§8.5）。 */
-        if out.broken() {
+        if writer.out.broken() {
             break;
         }
     }
+    let Writer {
+        out,
+        adopted,
+        failures,
+        deterministic,
+        body,
+        usages,
+        ..
+    } = writer;
 
     let interrupted = cancel_after.triggered();
     let outcome = Outcome {
@@ -224,6 +266,7 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         reason: most_common(&failures),
         deterministic: deterministic || interrupted,
         interrupted,
+        usages,
     };
     if !out.broken() {
         out.write_tail(&outcome)?;
@@ -235,6 +278,117 @@ pub async fn run_page(page: SplitPage, ctx: PipelineCtx<'_>, out: &mut Out) -> i
         }
     Ok(outcome)
 }
+
+/// 写出循环的按序状态（§8.1）：直播块增量上屏，完成块按序落定。
+struct Writer<'a> {
+    out: &'a mut Out,
+    /// 各块已累积的译文增量；只有直播块的会送到屏幕。
+    acc: Vec<String>,
+    /// 已完成、还没轮到写出的块。
+    pending: Vec<Option<BlockResult>>,
+    /// 各块前置空行数；直播块的空行随首个增量帧写进阅读器。
+    gaps: Vec<usize>,
+    /// 按序前缀中第一个未完成的块（§8.1 直播块）。
+    live: usize,
+    /// 直播块当前是否有内容在屏幕上；决定回退注记与空行补写。
+    shown: bool,
+    adopted: usize,
+    failures: Vec<Reason>,
+    diagnosed: bool,
+    deterministic: bool,
+    /// 整页译文（全部采用才落盘，§9.3）。
+    body: String,
+    /// 被采用请求的 usage，按块序（§8.3）。
+    usages: Vec<Usage>,
+}
+
+impl Writer<'_> {
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Delta { index, chunk } => {
+                if let Some(text) = self.acc.get_mut(index) {
+                    text.push_str(&chunk);
+                }
+                if index == self.live {
+                    let _ = self
+                        .out
+                        .write_live(self.gaps[self.live], &self.acc[self.live]);
+                    self.shown = true;
+                }
+            }
+            Event::Reset { index } => {
+                if let Some(text) = self.acc.get_mut(index) {
+                    text.clear();
+                }
+                if index == self.live {
+                    /* 重试清空已显示内容，屏幕上只出现当前尝试的内容（§7.5）。 */
+                    self.out.note("retrying");
+                    let _ = self.out.write_live(self.gaps[self.live], "");
+                    self.shown = true;
+                }
+            }
+            Event::Finished { index, result } => {
+                self.account(&result);
+                self.pending[index] = Some(result);
+                /* 按序落定：直播块完成即推进，静默累积的块轮到后整块出现。 */
+                while self.pending.get(self.live).is_some_and(|slot| slot.is_some()) {
+                    let result = self.pending[self.live].take().unwrap();
+                    self.finalize(result);
+                    self.live += 1;
+                    self.shown = false;
+                }
+            }
+        }
+    }
+
+    /// 失败诊断与原因统计：每个进程最多一条诊断（§10.5）。
+    fn account(&mut self, result: &BlockResult) {
+        if let Some(failure) = &result.failure {
+            if !self.diagnosed
+                && let Some(line) = &failure.diagnostic
+            {
+                self.out.diagnostic(line);
+                self.diagnosed = true;
+            }
+            if failure.reason != Reason::Interrupted {
+                self.failures.push(failure.reason);
+                if stops_submission(failure) {
+                    self.deterministic = true;
+                }
+            }
+        } else if result.translation.is_some() {
+            self.adopted += 1;
+        }
+    }
+
+    /// 落定一块：采用译文或回退预转换原文（§6.4）；整页译文与 usage 同步累积。
+    fn finalize(&mut self, result: BlockResult) {
+        let fallback = match (&result.translation, &result.failure) {
+            (Some(_), _) => None,
+            /* 直播块被整块替换：状态行挂 fallback 注记（§8.5）。 */
+            (None, Some(failure)) if self.shown => Some(failure.reason.as_str()),
+            (None, _) => None,
+        };
+        let text = result
+            .translation
+            .as_deref()
+            .unwrap_or(result.block.pre.as_str());
+        let _ = self.out.write_block(&result.block, text);
+        /* 注记在 Block 之后发送：Block 会清掉上一条 retrying。 */
+        if let Some(reason) = fallback {
+            self.out.note(&format!("fallback: {reason}"));
+        }
+        if let Some(translation) = &result.translation {
+            self.body
+                .extend(std::iter::repeat_n('\n', result.block.gap_before));
+            self.body.push_str(translation);
+        }
+        if let Some(usage) = result.usage {
+            self.usages.push(usage);
+        }
+    }
+}
+
 
 /// 整页预转换文本：全部块 `pre` 按 `gap_before`/`tail_gap` 重组（§9.1 哈希对象）。
 fn pre_text(page: &SplitPage) -> String {
@@ -273,54 +427,71 @@ enum Verdict {
     Rejected,
 }
 
-/// 一块的完整尝试：最多重试一次，重试前等 500ms（§7.7）。
+/// 一块的完整尝试：最多重试一次，重试前等 500ms 并清空已显示内容（§7.5）。
 ///
 /// 确定性失败之后不再发起重试；翻译期间的 Ctrl-C 直接放弃该块。
+/// 返回译文与被采用请求的 usage。
 async fn translate_block(
     backend: &Backend,
     system: &str,
     input: &str,
+    index: usize,
+    events: &tokio::sync::mpsc::UnboundedSender<Event>,
     stop: &AtomicBool,
     cancel: &CancelWatch,
-) -> Result<String, Failure> {
+) -> Result<(String, Option<Usage>), Failure> {
     let mut retried = false;
     loop {
         if cancel.triggered() {
             return Err(Failure::new(Reason::Interrupted, false));
         }
-        let verdict = match post(backend, system, input, cancel.clone()).await {
-            Ok(completion) => evaluate(&completion),
-            Err(failure) => {
-                if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
-                    retried = true;
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                }
-                return Err(failure);
-            }
+        let outcome = match post(backend, system, input, index, events, cancel.clone()).await {
+            Ok(completion) => match evaluate(&completion) {
+                Verdict::Accepted(text) => Some(Ok((text, completion.usage))),
+                Verdict::Rejected => None,
+            },
+            Err(failure) => Some(Err(failure)),
         };
-        let stopped = stop.load(Ordering::Relaxed);
-        match verdict {
-            Verdict::Accepted(text) => return Ok(text),
-            Verdict::Rejected if stopped || retried => {
-                return Err(Failure::new(Reason::BackendError, true));
-            }
-            Verdict::Rejected => {
-                retried = true;
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
+        if let Some(result) = outcome {
+            return match result {
+                Ok(accepted) => Ok(accepted),
+                Err(failure) => {
+                    if failure.retryable && !retried && !stop.load(Ordering::Relaxed) {
+                        retried = true;
+                        let _ = events.send(Event::Reset { index });
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    Err(failure)
+                }
+            };
         }
+        /* length 截断或缺 finish_reason：可重试失败，重试后仍失败回退该块（§7.4）。 */
+        if retried || stop.load(Ordering::Relaxed) {
+            return Err(Failure::new(Reason::BackendError, true));
+        }
+        retried = true;
+        let _ = events.send(Event::Reset { index });
+        tokio::time::sleep(RETRY_DELAY).await;
     }
 }
 
-/// 单次请求；取消触发时丢弃在途 future，不等它返回（§5.4）。
+/// 单次请求：增量经 `events` 转发；取消触发时丢弃在途 future，不等它返回（§5.4）。
 async fn post(
     backend: &Backend,
     system: &str,
     input: &str,
+    index: usize,
+    events: &tokio::sync::mpsc::UnboundedSender<Event>,
     mut cancel: CancelWatch,
 ) -> Result<Completion, Failure> {
-    let request = backend.post(system, input);
+    let mut on_delta = |chunk: &str| {
+        let _ = events.send(Event::Delta {
+            index,
+            chunk: chunk.to_string(),
+        });
+    };
+    let request = backend.post(system, input, &mut on_delta);
     futures::pin_mut!(request);
     tokio::select! {
         result = &mut request => result,
@@ -368,9 +539,10 @@ fn is_blank_line(text: &str) -> bool {
     text.chars().all(|c| matches!(c, ' ' | '\t' | '\r'))
 }
 
-/// §7.4 采用判定：2xx + 未被 length 截断 + 非空白；合法 UTF-8 由 JSON 反序列化保证。
+/// §7.4 采用判定：`finish_reason == "stop"` 且非空白；length 与缺 finish_reason
+/// 按 `Verdict::Rejected` 走可重试失败；合法 UTF-8 由 JSON 反序列化保证。
 fn evaluate(completion: &Completion) -> Verdict {
-    if completion.truncated {
+    if !completion.stopped {
         return Verdict::Rejected;
     }
     let text = postprocess(&completion.content);
@@ -417,12 +589,13 @@ mod tests {
     fn completion(content: &str, finish: Option<&str>) -> Completion {
         Completion {
             content: content.to_string(),
-            truncated: finish == Some("length"),
+            stopped: finish == Some("stop"),
+            usage: None,
         }
     }
 
     #[test]
-    fn 采用判定拒绝空白与截断() {
+    fn 采用判定拒绝空白截断与缺_finish_reason() {
         assert!(matches!(
             evaluate(&completion("   \n", Some("stop"))),
             Verdict::Rejected
@@ -431,6 +604,8 @@ mod tests {
             evaluate(&completion("ok", Some("length"))),
             Verdict::Rejected
         ));
+        // 流结束未见 finish_reason：可重试失败（§7.4）。
+        assert!(matches!(evaluate(&completion("ok", None)), Verdict::Rejected));
         assert!(matches!(
             evaluate(&completion("纯文本", Some("stop"))),
             Verdict::Accepted(_)

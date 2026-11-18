@@ -694,7 +694,7 @@ pub fn assert_bytes_eq(ours: &[u8], baseline: &[u8], label: &str) {
 
 #[derive(Clone)]
 pub enum Reply {
-    /// 200 + JSON。
+    /// 200：脚本化的完整 chat.completion JSON，转成 SSE 流（§7.1 客户端固定流式）。
     Ok(Value),
     /// 指定状态码 + JSON。
     Status(u16, Value),
@@ -704,6 +704,65 @@ pub enum Reply {
     Delay(Duration, Value),
     /// 等指定文件出现再回 200 + JSON：让慢块由测试观察到的同步信号放行，而不是固定计时窗口。
     AwaitFile(PathBuf, Duration, Value),
+    /// 逐帧 SSE：每帧发出前等待指定时长；`done` 决定是否补 `data: [DONE]`。
+    /// 帧用 [`chunk`]/[`usage_chunk`] 构造；`done = false` 模拟流中途断开。
+    Sse(Vec<(Duration, Value)>, bool),
+}
+
+/// 一帧 `chat.completion.chunk`；`usage` 只在需要展示时挂上。
+pub fn chunk(content: Option<&str>, finish: Option<&str>, usage: Option<Value>) -> Value {
+    let mut delta = json!({});
+    if let Some(content) = content {
+        delta["content"] = json!(content);
+    }
+    let mut choice = json!({"index": 0, "delta": delta});
+    if let Some(finish) = finish {
+        choice["finish_reason"] = json!(finish);
+    }
+    let mut frame = json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": [choice],
+    });
+    if let Some(usage) = usage {
+        frame["usage"] = usage;
+    }
+    frame
+}
+
+/// 独立 usage 块：`choices` 为空数组（§7.5 OpenAI 形态）。
+pub fn usage_chunk(usage: Value) -> Value {
+    json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": [],
+        "usage": usage,
+    })
+}
+
+/// 把脚本化的完整 chat.completion JSON 转成 SSE 响应体：
+/// 内容 delta 帧 → finish 帧（脚本里有才发）→ usage 帧（脚本里有才发）→ [DONE]。
+fn completion_to_sse(value: &Value) -> String {
+    let mut body = String::new();
+    if let Some(content) = value["choices"][0]["message"]["content"].as_str() {
+        body.push_str(&sse_line(&chunk(Some(content), None, None)));
+    }
+    if let Some(finish) = value["choices"][0]["finish_reason"].as_str() {
+        body.push_str(&sse_line(&chunk(None, Some(finish), None)));
+    }
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+        body.push_str(&sse_line(&usage_chunk(usage.clone())));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn sse_line(frame: &Value) -> String {
+    format!("data: {frame}\n\n")
 }
 
 #[derive(Clone, Debug)]
@@ -817,23 +876,44 @@ async fn handle_model_request(State(state): State<Arc<ModelState>>, request: Req
     let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(now, Ordering::SeqCst);
     let response = match reply {
-        Reply::Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Reply::Ok(value) => sse_response(completion_to_sse(&value)),
         Reply::Status(code, value) => (status(code), Json(value)).into_response(),
         Reply::Raw(code, body) => (status(code), body).into_response(),
         Reply::Delay(delay, value) => {
             tokio::time::sleep(delay).await;
-            (StatusCode::OK, Json(value)).into_response()
+            sse_response(completion_to_sse(&value))
         }
         Reply::AwaitFile(path, timeout, value) => {
             let deadline = tokio::time::Instant::now() + timeout;
             while !path.exists() && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            (StatusCode::OK, Json(value)).into_response()
+            sse_response(completion_to_sse(&value))
+        }
+        Reply::Sse(frames, done) => {
+            let mut body = String::new();
+            for (delay, frame) in frames {
+                tokio::time::sleep(delay).await;
+                body.push_str(&sse_line(&frame));
+            }
+            if done {
+                body.push_str("data: [DONE]\n\n");
+            }
+            sse_response(body)
         }
     };
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
     response
+}
+
+/// 200 + SSE 响应体。
+fn sse_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        body,
+    )
+        .into_response()
 }
 
 fn status(code: u16) -> StatusCode {

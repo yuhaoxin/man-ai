@@ -1,16 +1,17 @@
 //! 阅读器的 PTY 进程级契约（§5.4、§8、§13.3）。
 //!
 //! 接管/恢复终端、`q`、Ctrl-C 两阶段、SIGTERM/SIGHUP 按信号死、Ctrl-Z 忽略、
-//! 阅读器初始化失败直写原文、不翻译 TTY 页面进阅读器。
+//! 阅读器初始化失败直写原文、不翻译 TTY 页面进阅读器、直播块增量上屏。
 
 mod common;
 
 use std::time::Duration;
 
 use common::{
-    FakeModel, Reply, TempDir, compact, completion, model_config_with, plain, run_reader_driven,
-    run_reader_signaled, run_reader_tty, wait_seen,
+    FakeModel, Reply, TempDir, chunk, compact, completion, model_config_with, plain,
+    run_reader_driven, run_reader_signaled, run_reader_tty, wait_seen,
 };
+use serde_json::json;
 
 const LANG: &str = "zh-CN";
 /// 首块前占位行（空格在帧 diff 里被跳过，断言去空格）。
@@ -265,4 +266,86 @@ fn 不翻译的_tty_页面进阅读器显示预转换原文() {
     // 不发请求、不查缓存。
     assert_eq!(model.count(), 0);
     assert!(run.stderr.is_empty(), "{}", run.stderr);
+}
+
+#[test]
+fn 直播块增量上屏_首帧先于流收齐() {
+    // 首帧后停 600ms 再收尾：增量必然先于尾行出现在屏幕上。
+    let reply = Reply::Sse(
+        vec![
+            (Duration::ZERO, chunk(Some("PART"), None, None)),
+            (
+                Duration::from_millis(600),
+                chunk(Some("IAL"), None, None),
+            ),
+            (Duration::ZERO, chunk(None, Some("stop"), None)),
+        ],
+        true,
+    );
+    let model = FakeModel::start(vec![reply]);
+    let dir = TempDir::new("t26-live");
+    dir.write_config(&model_config_with(&model, 4, ""));
+    let run = run_reader_driven(
+        &dir,
+        &["--lang", LANG],
+        b"block\n",
+        &[],
+        "",
+        move |_pid, writer, seen| {
+            // 直播增量：流尚未收齐，首帧内容已在屏幕上。
+            wait_seen(seen, "PART", Duration::from_secs(10));
+            wait_seen(
+                seen,
+                "──man-ai:translated(SimplifiedChinese)──",
+                Duration::from_secs(30),
+            );
+            let _ = writer.write_all(b"q");
+        },
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let text = compact(&run.text());
+    assert!(text.contains("PARTIAL"), "{text}");
+}
+
+#[test]
+fn 直播块失败整块替换并挂_fallback_注记() {
+    // 两次尝试都在流中途遇到 error 帧：重试一次后整块替换为预转换原文。
+    let error_frame = json!({"error": {"message": "boom", "type": "server_error"}});
+    let reply = Reply::Sse(
+        vec![
+            (Duration::ZERO, chunk(Some("半截"), None, None)),
+            (Duration::ZERO, error_frame),
+        ],
+        true,
+    );
+    let model = FakeModel::start_by_content(vec![("原文块\n".to_string(), reply)]);
+    let dir = TempDir::new("t26-fallback");
+    dir.write_config(&model_config_with(&model, 4, ""));
+    let run = run_reader_driven(
+        &dir,
+        &["--lang", LANG],
+        "原文块\n".as_bytes(),
+        &[],
+        "",
+        move |_pid, writer, seen| {
+            wait_seen(
+                seen,
+                "fallback:backenderror",
+                Duration::from_secs(30),
+            );
+            // 整块替换后的最终形态：部分回退的尾行。
+            wait_seen(
+                seen,
+                "──man-ai:partiallytranslated(0/1blocks,backenderror)──",
+                Duration::from_secs(30),
+            );
+            let _ = writer.write_all(b"q");
+        },
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let text = compact(&run.text());
+    // 整块替换：直播的半截译文不在屏幕上，原文在。
+    assert!(text.contains("原文块"), "{text}");
+    assert!(!text.contains("半截"), "{text}");
+    assert!(text.contains("fallback:backenderror"), "{text}");
 }

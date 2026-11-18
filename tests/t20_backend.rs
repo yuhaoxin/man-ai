@@ -51,13 +51,19 @@ fn 请求体字段固定且系统提示逐字节() {
             "model",
             "reasoning_effort",
             "stream",
+            "stream_options",
             "temperature"
         ]
     );
     assert_eq!(request.body["model"], "test-model");
     assert_eq!(request.body["reasoning_effort"], "low");
     assert_eq!(request.body["temperature"].as_f64(), Some(0.0));
-    assert_eq!(request.body["stream"], json!(false));
+    // 固定流式：`stream: true` + `stream_options.include_usage: true`（§10.3）。
+    assert_eq!(request.body["stream"], json!(true));
+    assert_eq!(
+        request.body["stream_options"],
+        json!({"include_usage": true})
+    );
 
     let messages = request.body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);

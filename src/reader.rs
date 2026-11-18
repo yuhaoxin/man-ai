@@ -358,11 +358,13 @@ enum Decision {
     Quit,
 }
 
-/// 阅读器状态：内容行、视口、搜索与状态行口径。
+/// 阅读器状态：内容行、直播段、视口、搜索与状态行口径。
 struct View {
     lines: Vec<Line<'static>>,
     /// 占位行还在正文里。
     placeholder: bool,
+    /// 直播段占的行数；`None` 表示当前没有直播块（§8.1）。
+    live_len: Option<usize>,
     translating: bool,
     done: bool,
     start: Instant,
@@ -378,6 +380,8 @@ struct View {
     /// 上一帧的正文区高度。
     viewport: usize,
     search: Search,
+    /// 状态行注记（§8.5）：`retrying` 或 `fallback: <reason>`。
+    note: Option<String>,
     diagnostics: Vec<String>,
 }
 
@@ -396,6 +400,7 @@ impl View {
         Self {
             lines: Vec::new(),
             placeholder: false,
+            live_len: None,
             translating: true,
             done: false,
             start,
@@ -408,6 +413,7 @@ impl View {
             prefix: Vec::new(),
             viewport: 0,
             search: Search::Idle,
+            note: None,
             diagnostics: Vec::new(),
         }
     }
@@ -425,15 +431,37 @@ impl View {
                 self.placeholder = true;
             }
             Message::Block { gap, body } => {
-                if self.placeholder {
-                    self.placeholder = false;
-                    self.lines.pop();
-                }
-                for _ in 0..gap {
-                    self.lines.push(Line::from(""));
+                /* 落定直播块：直播段的空行已随首个 Live 写入，只换正文。 */
+                if let Some(live_len) = self.live_len.take() {
+                    self.lines
+                        .truncate(self.lines.len().saturating_sub(live_len));
+                } else {
+                    self.clear_placeholder();
+                    for _ in 0..gap {
+                        self.lines.push(Line::from(""));
+                    }
                 }
                 self.lines.extend(markdown::to_lines(&body));
+                self.note = None;
             }
+            Message::Live { gap, text } => {
+                if self.live_len.is_none() {
+                    /* 新的直播块：空行先落，注记随上一块的落定清掉。 */
+                    self.clear_placeholder();
+                    for _ in 0..gap {
+                        self.lines.push(Line::from(""));
+                    }
+                    self.note = None;
+                } else if let Some(live_len) = self.live_len {
+                    self.lines
+                        .truncate(self.lines.len().saturating_sub(live_len));
+                }
+                // 每帧重解析累积文本，与完成块同一条 Markdown 渲染路径（§8.1）。
+                let rendered = markdown::to_lines(&text);
+                self.live_len = Some(rendered.len());
+                self.lines.extend(rendered);
+            }
+            Message::Note(text) => self.note = Some(text),
             Message::Diagnostic(line) => self.diagnostics.push(line),
             Message::Tail(text) => {
                 self.lines.push(Line::from(""));
@@ -630,11 +658,28 @@ impl View {
             .scroll((self.offset as u16, 0));
         frame.render_widget(paragraph, content);
         let status_line = match &self.search {
-            Search::Idle => format!("elapsed {:.1}s", self.elapsed().as_secs_f32()),
+            Search::Idle => self.status(),
             Search::Typing(query) => format!("/{query}"),
             Search::Active { query, .. } => format!("/{query}"),
         };
         frame.render_widget(Paragraph::new(status_line), status);
+    }
+
+    /// 状态行：elapsed 加直播注记（§8.5 注记在指标字段之外）。
+    fn status(&self) -> String {
+        let mut line = format!("elapsed {:.1}s", self.elapsed().as_secs_f32());
+        if let Some(note) = &self.note {
+            line.push_str(&format!(" · {note}"));
+        }
+        line
+    }
+
+    /// 占位行只在正文里时摘掉。
+    fn clear_placeholder(&mut self) {
+        if self.placeholder {
+            self.placeholder = false;
+            self.lines.pop();
+        }
     }
 
     /// 整页流逝时间：接管起到最后一块处置完成（§8.3）。
@@ -888,6 +933,145 @@ mod tests {
         let narrow = render(&mut view, 7, 8);
         assert!(narrow.iter().any(|line| line.contains("aaa bbb")));
         assert!(narrow.iter().any(|line| line.contains("ccc ddd")));
+    }
+
+    #[test]
+    fn 直播块增量上屏_完成后整块落定() {
+        let mut view = translating_view();
+        view.update(Message::Live {
+            gap: 0,
+            text: "PART".to_string(),
+        });
+        let first = render(&mut view, 60, 8);
+        assert!(first.iter().any(|line| line.contains("PART")));
+
+        // 同一块的后续帧替换直播段，旧内容保留、新内容追加。
+        view.update(Message::Live {
+            gap: 0,
+            text: "PARTIAL".to_string(),
+        });
+        let second = render(&mut view, 60, 8);
+        assert!(second.iter().any(|line| line.contains("PARTIAL")));
+        assert!(second.iter().all(|line| !line.contains("PART\n")));
+
+        // 落定：整块替换，直播段归零，下一块可开新的直播段。
+        view.update(Message::Block {
+            gap: 0,
+            body: "PARTIAL DONE\n".to_string(),
+        });
+        let third = render(&mut view, 60, 8);
+        assert!(third.iter().any(|line| line.contains("PARTIAL DONE")));
+        assert!(view.live_len.is_none());
+    }
+
+    #[test]
+    fn 直播帧走同一条_markdown_路径_未闭合标记字面显示() {
+        let mut view = translating_view();
+        view.update(Message::Live {
+            gap: 0,
+            text: "**bold and *emph".to_string(),
+        });
+        let screen = render(&mut view, 60, 8);
+        // 未闭合标记按字面显示（§8.1）。
+        assert!(
+            screen.iter().any(|line| line.contains("**bold")),
+            "{screen:?}"
+        );
+        assert!(
+            screen.iter().any(|line| line.contains("*emph")),
+            "{screen:?}"
+        );
+    }
+
+    #[test]
+    fn 直播块失败整块替换后视口行偏移保持() {
+        let mut view = translating_view();
+        let long: String = (0..40).map(|n| format!("L{n:02}\n")).collect();
+        view.update(Message::Live {
+            gap: 0,
+            text: long,
+        });
+        let _ = render(&mut view, 60, 8);
+        // 上滚停跟随，留下确定的行偏移。
+        for _ in 0..5 {
+            assert!(matches!(view.input(InputEvent::Up), Decision::Continue));
+        }
+        assert!(!view.follow);
+        let before = view.offset;
+        assert!(before > 0);
+
+        // 失败整块替换为预转换原文：行数相近，视口不回跳页首。
+        let original: String = (0..38).map(|n| format!("O{n:02}\n")).collect();
+        view.update(Message::Block {
+            gap: 0,
+            body: original,
+        });
+        let screen = render(&mut view, 60, 8);
+        assert_eq!(view.offset, before, "视口保持当前行偏移");
+        // 偏移行附近是替换后的原文，直播残留不在屏幕上。
+        assert!(
+            screen.iter().any(|line| line.contains("O2")),
+            "{screen:?}"
+        );
+        assert!(screen.iter().all(|line| !line.contains("L")));
+    }
+
+    #[test]
+    fn 重试清空直播段_屏幕只出现当前尝试的内容() {
+        let mut view = translating_view();
+        view.update(Message::Live {
+            gap: 0,
+            text: "OLD".to_string(),
+        });
+        assert!(render(&mut view, 60, 8).iter().any(|l| l.contains("OLD")));
+        // Reset 转发为空直播：旧内容清掉。
+        view.update(Message::Live {
+            gap: 0,
+            text: String::new(),
+        });
+        assert!(render(&mut view, 60, 8).iter().all(|l| !l.contains("OLD")));
+        view.update(Message::Live {
+            gap: 0,
+            text: "NEW".to_string(),
+        });
+        let screen = render(&mut view, 60, 8);
+        assert!(screen.iter().any(|l| l.contains("NEW")));
+        assert!(screen.iter().all(|l| !l.contains("OLD")));
+    }
+
+    #[test]
+    fn 状态行注记_retrying_与_fallback() {
+        let mut view = translating_view();
+        view.update(Message::Live {
+            gap: 0,
+            text: "BODY".to_string(),
+        });
+        view.update(Message::Note("retrying".to_string()));
+        let screen = render(&mut view, 60, 8);
+        assert!(screen[7].contains("retrying"), "{screen:?}");
+
+        // 落定清注记；失败替换后再挂 fallback 注记。
+        view.update(Message::Note("retrying".to_string()));
+        view.update(Message::Block {
+            gap: 0,
+            body: "原文\n".to_string(),
+        });
+        view.update(Message::Note("fallback: timeout".to_string()));
+        let screen = render(&mut view, 60, 8);
+        assert!(screen[7].contains("fallback: timeout"), "{screen:?}");
+        assert!(!screen[7].contains("retrying"), "{screen:?}");
+    }
+
+    #[test]
+    fn 占位行随首个直播帧消失() {
+        let mut view = translating_view();
+        view.update(Message::Live {
+            gap: 0,
+            text: "FIRST".to_string(),
+        });
+        let screen = render(&mut view, 60, 8);
+        assert!(screen.iter().all(|line| !line.contains(PLACEHOLDER)));
+        assert!(screen.iter().any(|line| line.contains("FIRST")));
     }
 
     #[test]
