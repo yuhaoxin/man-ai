@@ -7,6 +7,26 @@ use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+/// 把行内文本里的连续空格/制表符折叠为单个空格（规格 §8.2 渲染语义）。
+fn collapse_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending = false;
+    for c in text.chars() {
+        if matches!(c, ' ' | '\t') {
+            pending = true;
+        } else {
+            if std::mem::replace(&mut pending, false) {
+                out.push(' ');
+            }
+            out.push(c);
+        }
+    }
+    if pending {
+        out.push(' ');
+    }
+    out
+}
+
 /// 把一段 Markdown 渲染为行；块边界补空行。
 pub fn to_lines(src: &str) -> Vec<Line<'static>> {
     let mut renderer = Renderer::default();
@@ -34,6 +54,8 @@ struct Renderer {
     /// 缩进代码块的内容缓冲：模型按清单只会用围栏代码块，缩进代码块是保留了
     /// man 排版行首缩进的正文，降级为段落处理——缓冲后重新走一遍解析。
     indented: Option<String>,
+    /// 当前在围栏代码块内：内容逐字节保留，不做空白折叠。
+    fenced: bool,
 }
 
 impl Renderer {
@@ -43,7 +65,10 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => match &mut self.indented {
                 Some(buffer) => buffer.push_str(&text),
-                None => self.text(&text),
+                // 行内文本的连续空白不表意（CommonMark 渲染语义），折叠为单个
+                // 空格；围栏代码块逐字节保留。
+                None if self.fenced => self.text(&text),
+                None => self.text(&collapse_ws(&text)),
             },
             Event::Code(text) => self.text(&text),
             Event::SoftBreak | Event::HardBreak => self.break_line(),
@@ -67,6 +92,7 @@ impl Renderer {
             Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
                 self.block();
                 self.flush();
+                self.fenced = true;
             }
             Tag::CodeBlock(CodeBlockKind::Indented) => {
                 self.block();
@@ -100,6 +126,7 @@ impl Renderer {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::CodeBlock => {
+                self.fenced = false;
                 // 缩进代码块降级为段落：缓冲内容重新解析（原事件的行内解析
                 // 已在块解析阶段被跳过，重放后强调等标记照常生效）。
                 if let Some(buffer) = self.indented.take() {
@@ -334,6 +361,15 @@ mod tests {
         // 预转换产物（**bold** / *underline*）本身是合法 Markdown。
         let lines = render("**ls** - 列出\n\n*用途* - 提示");
         assert_eq!(lines, vec!["ls - 列出", "", "用途 - 提示"]);
+    }
+
+    #[test]
+    fn 行内多余空白折叠为单个空格() {
+        // 模型保留 man 的列对齐空格时，正文不应带着错位渲染；Markdown 行内
+        // 文本的连续空白本就不表意，折叠为单个空格。围栏代码块与行内代码
+        // 逐字节保留，不折叠。
+        let lines = render("**-q**      强制将文件名打印\n\n```\n-a  --x\n-b    --y\n```\n\n`a  b` end");
+        assert_eq!(lines, vec!["-q 强制将文件名打印", "", "-a  --x", "-b    --y", "", "a  b end"]);
     }
 
     #[test]
