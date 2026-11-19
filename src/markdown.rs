@@ -3,7 +3,7 @@
 //! 只实现提示词允许清单里的七种结构（§7.2 规则 3）；清单外的事件按字面文本
 //! 落行，不做能力探测。折行交给渲染端的 `Wrap`。
 
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -31,6 +31,9 @@ struct Renderer {
     item_indent: String,
     /// 块开始前需要补一个空行。
     need_gap: bool,
+    /// 缩进代码块的内容缓冲：模型按清单只会用围栏代码块，缩进代码块是保留了
+    /// man 排版行首缩进的正文，降级为段落处理——缓冲后重新走一遍解析。
+    indented: Option<String>,
 }
 
 impl Renderer {
@@ -38,7 +41,10 @@ impl Renderer {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.text(&text),
+            Event::Text(text) => match &mut self.indented {
+                Some(buffer) => buffer.push_str(&text),
+                None => self.text(&text),
+            },
             Event::Code(text) => self.text(&text),
             Event::SoftBreak | Event::HardBreak => self.break_line(),
             Event::Rule => self.rule(),
@@ -58,9 +64,14 @@ impl Renderer {
                 self.block();
                 self.bold = true;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
                 self.block();
                 self.flush();
+            }
+            Tag::CodeBlock(CodeBlockKind::Indented) => {
+                self.block();
+                self.flush();
+                self.indented = Some(String::new());
             }
             Tag::List(start) => {
                 if self.lists.is_empty() {
@@ -88,6 +99,16 @@ impl Renderer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
+            TagEnd::CodeBlock => {
+                // 缩进代码块降级为段落：缓冲内容重新解析（原事件的行内解析
+                // 已在块解析阶段被跳过，重放后强调等标记照常生效）。
+                if let Some(buffer) = self.indented.take() {
+                    for event in Parser::new(&buffer) {
+                        self.event(event);
+                    }
+                }
+                self.flush();
+            }
             TagEnd::Paragraph
             | TagEnd::Heading(_)
             | TagEnd::BlockQuote(_)
@@ -96,7 +117,6 @@ impl Renderer {
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::CodeBlock
             | TagEnd::Table
             | TagEnd::TableHead
             | TagEnd::TableRow
@@ -314,5 +334,15 @@ mod tests {
         // 预转换产物（**bold** / *underline*）本身是合法 Markdown。
         let lines = render("**ls** - 列出\n\n*用途* - 提示");
         assert_eq!(lines, vec!["ls - 列出", "", "用途 - 提示"]);
+    }
+
+    #[test]
+    fn 缩进代码块降级为段落重新解析() {
+        // 模型保留 man 排版的行首缩进时，CommonMark 把这段解析成缩进代码块
+        // （不在允许清单内）；降级为段落即内容重新做行内解析，强调照常渲染。
+        let lines = render("para\n\n     **--color**=*when*\n           根据 *when* 输出\n\nafter");
+        assert_eq!(lines, vec!["para", "", "--color=when", "根据 when 输出", "", "after"]);
+        let spans = &to_lines("para\n\n     **--color**=*when*")[2].spans;
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 }
