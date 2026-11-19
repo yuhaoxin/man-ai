@@ -124,7 +124,7 @@ fn 缓存条目首行注释键字段逐一比对() {
         comment_fields(&entry(&dir)),
         vec![
             ("v".to_string(), "3".to_string()),
-            ("prompt".to_string(), "4".to_string()),
+            ("prompt".to_string(), "5".to_string()),
             ("endpoint".to_string(), model.endpoint().to_string()),
             ("model".to_string(), "test-model".to_string()),
             ("reasoning".to_string(), "low".to_string()),

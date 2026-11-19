@@ -444,7 +444,7 @@ mod tests {
             fields,
             vec![
                 ("v", "3"),
-                ("prompt", "4"),
+                ("prompt", "5"),
                 ("endpoint", "https://api.example.com/v1"),
                 ("model", "test%20model"),
                 ("reasoning", "low"),
@@ -476,7 +476,7 @@ mod tests {
         let stored = fs::read_to_string(&path).unwrap();
         assert_eq!(
             stored,
-            "<!-- v=3 prompt=4 endpoint=https://api.example.com/v1 model=m reasoning=low hash=7f063821988e288503bb9cc55c4d108d -->\n译文\n"
+            "<!-- v=3 prompt=5 endpoint=https://api.example.com/v1 model=m reasoning=low hash=7f063821988e288503bb9cc55c4d108d -->\n译文\n"
         );
 
         // 任一键字段变化即不命中。
@@ -550,7 +550,7 @@ mod tests {
             .join(format!("{}.md", key.file_stem()));
         assert_eq!(
             fs::read(&path).unwrap(),
-            "<!-- v=3 prompt=4 endpoint=https://api.example.com/v1 model=m reasoning=low hash=1b8056e2b8f4fd9e72a6c1b9b3f1c305 -->\n译文\n"
+            "<!-- v=3 prompt=5 endpoint=https://api.example.com/v1 model=m reasoning=low hash=1b8056e2b8f4fd9e72a6c1b9b3f1c305 -->\n译文\n"
                 .as_bytes()
         );
         let mode = fs::metadata(dir.path().join("man-ai"))
