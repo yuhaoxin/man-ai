@@ -292,10 +292,11 @@ fn hex16(digest: &[u8; 32]) -> String {
 
 /// 页眉 `NAME(SECTION)`：页名转小写；页名与 section 只接受文件名安全字符，
 /// 含其它字符（空格、路径分隔符等）视为解析失败（§9.1）。
+/// 真实页眉是跑头（`NAME(SECTION)` 居中文字 `NAME(SECTION)`），只取行首 token。
 fn parse_header(line: &str) -> Option<(String, String)> {
+    let token = line.split_whitespace().next()?;
     // 预转换把粗体页眉转成 `**NAME(SECTION)**`，先剥掉强调标记。
-    let line = line.trim().trim_matches('*').trim();
-    let body = line.strip_suffix(')')?;
+    let body = token.trim_matches('*').strip_suffix(')')?;
     let open = body.rfind('(')?;
     let (name, section) = (&body[..open], &body[open + 1..]);
     let safe =
@@ -382,6 +383,15 @@ mod tests {
             ("a b(1)", None),
             ("../evil(1)", None),
             ("a(b)(1)", None),
+            // 真实 man 页眉是行内重复的 `NAME(SECTION)`（跑头），取行首 token。
+            (
+                "LS(1)                       General Commands Manual                      LS(1)",
+                Some(("ls", "1")),
+            ),
+            (
+                "**LS(1)**                   General Commands Manual                      **LS(1)**",
+                Some(("ls", "1")),
+            ),
         ];
         for (line, expected) in table {
             let expected = expected.map(|(name, section)| (name.to_string(), section.to_string()));
