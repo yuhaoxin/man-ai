@@ -626,10 +626,18 @@ mod tests {
         let base = dir.path().join("cache");
         fs::create_dir(&base).unwrap();
         fs::set_permissions(&base, fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = base.join("probe");
+        let privileged_write = fs::create_dir(&probe).is_ok();
+        let _ = fs::remove_dir(&probe);
         let (cache, warning) = open_at(base.to_str(), None);
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!cache.enabled());
-        assert!(warning.unwrap().starts_with("cache unavailable ("));
+        if privileged_write {
+            assert!(cache.enabled());
+            assert!(warning.is_none());
+        } else {
+            assert!(!cache.enabled());
+            assert!(warning.unwrap().starts_with("cache unavailable ("));
+        }
     }
 
     #[test]
