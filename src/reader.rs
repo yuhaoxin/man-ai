@@ -34,7 +34,7 @@ use signal_hook::low_level;
 use crate::markdown;
 use crate::metrics::PageMetrics;
 use crate::output::Message;
-use crate::signals::{self, CancelTrigger};
+use crate::signals::{self, CancelTrigger, Termination};
 
 /// 首块到达前的占位行（§8.1）。
 const PLACEHOLDER: &str = "Translating… (waiting for the first block)";
@@ -68,8 +68,8 @@ pub fn takeover() -> Result<TermGuard, String> {
         return Err(error.to_string());
     }
     match signals::install_termination() {
-        Ok(signal_ids) => Ok(TermGuard {
-            signal_ids,
+        Ok(termination) => Ok(TermGuard {
+            termination: Some(termination),
             input_ids: input.ids.clone(),
             input,
         }),
@@ -82,14 +82,16 @@ pub fn takeover() -> Result<TermGuard, String> {
 
 /// 终端持有权：丢弃时恢复终端、摘除信号处理器并停掉输入线程。
 pub struct TermGuard {
-    signal_ids: Vec<SigId>,
+    termination: Option<Termination>,
     input_ids: Vec<SigId>,
     input: Input,
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        signals::uninstall_termination(std::mem::take(&mut self.signal_ids));
+        if let Some(termination) = self.termination.take() {
+            termination.uninstall();
+        }
         for id in std::mem::take(&mut self.input_ids) {
             low_level::unregister(id);
         }

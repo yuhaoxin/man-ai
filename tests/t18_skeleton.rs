@@ -138,6 +138,15 @@ fn lang_合法时不报错并进入分页器模式() {
     assert!(out.stderr.is_empty());
 }
 
+#[test]
+fn english_路径不因分页器参数写_stderr() {
+    let dir = TempDir::new("t18-english-pager-args");
+    let run = run_pipe(&dir, &["--lang", "en", "--pager", "less", "ls"], b"page\n", &[]);
+    assert_eq!(run.code, 0);
+    assert_eq!(run.stderr, b"");
+    assert_eq!(run.stdout, b"page\n");
+}
+
 // ---------------------------------------------------------------- 分页器模式
 
 #[test]

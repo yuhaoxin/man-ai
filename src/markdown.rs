@@ -137,7 +137,6 @@ impl Renderer {
                 self.flush();
             }
             TagEnd::Paragraph
-            | TagEnd::Heading(_)
             | TagEnd::BlockQuote(_)
             | TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
@@ -148,6 +147,10 @@ impl Renderer {
             | TagEnd::TableHead
             | TagEnd::TableRow
             | TagEnd::TableCell => self.flush(),
+            TagEnd::Heading(_) => {
+                self.bold = false;
+                self.flush();
+            }
             TagEnd::Item => {
                 self.flush();
                 self.item_prefix.clear();
@@ -305,6 +308,13 @@ mod tests {
         assert_eq!(lines, vec!["LS(1)", "", "plain text"]);
         assert!(
             to_lines("# LS(1)")[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        let after = to_lines("# LS(1)\n\nplain text");
+        assert!(
+            !after[2].spans[0]
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)

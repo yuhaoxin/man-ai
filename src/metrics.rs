@@ -214,6 +214,19 @@ mod tests {
     }
 
     #[test]
+    fn 非缓存输入对不一致计数饱和为零() {
+        let mut metrics = PageMetrics::default();
+        metrics.record(event(
+            Some(usage(10, 1, Some(20), Some(5))),
+            Duration::from_secs(1),
+        ));
+        assert_eq!(
+            line(&metrics, Duration::from_secs(1), 100),
+            "elapsed 1.0s · out 1 · tps 1 · cached 20 · in 0"
+        );
+    }
+
+    #[test]
     fn completion_tokens缺失_out与tps未知不按零补() {
         let mut metrics = PageMetrics::default();
         metrics.record(event(

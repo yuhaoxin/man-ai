@@ -1,18 +1,21 @@
 //! 取消通道与终止信号处置（规格 §5.4）。
 //!
 //! Ctrl-C 在 raw 模式下是按键事件，由阅读器经取消通道通知翻译；SIGTERM/SIGHUP
-//! 处理器先恢复终端，再以默认处置重新触发自身（退出码 128+n）。Ctrl-Z 是 raw
+//! 处理器线程收到信号后恢复终端，再以默认处置重新触发自身（退出码 128+n）。Ctrl-Z 是 raw
 //! 模式下的普通按键，阅读器不绑定、按忽略处理。
 //!
 //! SIGPIPE 不用处理：Rust 启动时已把它设为忽略，写失败按 EPIPE 处理。
 
 use std::io;
+use std::thread::{self, JoinHandle};
 
 use tokio::sync::watch;
 
-use signal_hook::SigId;
+use crossterm::event::DisableMouseCapture;
+use crossterm::execute;
+use crossterm::terminal::LeaveAlternateScreen;
 use signal_hook::consts::{SIGHUP, SIGTERM};
-use signal_hook::low_level;
+use signal_hook::iterator::{Handle, Signals};
 
 /// Ctrl-C 取消通道：阅读器持触发端，翻译持观察端。
 pub fn cancel_pair() -> (CancelTrigger, CancelWatch) {
@@ -54,23 +57,46 @@ impl CancelWatch {
     }
 }
 
-/// 安装 SIGTERM/SIGHUP 处理器（§5.4）。
-///
-/// 处理器恢复终端后以默认处置重新触发自身；返回的 `SigId` 交给
-/// [`uninstall_termination`] 在阅读器退出时摘除。
-pub fn install_termination() -> io::Result<Vec<SigId>> {
-    let mut ids = Vec::new();
-    for signal in [SIGTERM, SIGHUP] {
-        let id = unsafe { low_level::register(signal, move || terminate(signal))? };
-        ids.push(id);
-    }
-    Ok(ids)
+pub struct Termination {
+    handle: Handle,
+    thread: Option<JoinHandle<()>>,
 }
 
-/// 摘除处理器，恢复默认处置。
-pub fn uninstall_termination(ids: Vec<SigId>) {
-    for id in ids {
-        low_level::unregister(id);
+/// 安装 SIGTERM/SIGHUP 的管道处理器（§5.4）。
+///
+/// 实际终端恢复由普通线程执行；收到信号后恢复默认处置并重新触发自身。
+pub fn install_termination() -> io::Result<Termination> {
+    let mut signals = Signals::new([SIGTERM, SIGHUP])?;
+    let handle = signals.handle();
+    let thread = thread::spawn(move || {
+        for signal in signals.forever() {
+            restore_terminal();
+            // SAFETY: `SIG_DFL` 是合法处置值；重发只影响本进程。
+            unsafe {
+                libc::signal(signal as libc::c_int, libc::SIG_DFL);
+                libc::raise(signal as libc::c_int);
+            }
+        }
+    });
+    Ok(Termination {
+        handle,
+        thread: Some(thread),
+    })
+}
+
+impl Termination {
+    /// 摘除处理器并恢复默认处置。
+    pub fn uninstall(mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for signal in [SIGTERM, SIGHUP] {
+            // SAFETY: `SIG_DFL` 是合法处置值。
+            unsafe {
+                libc::signal(signal as libc::c_int, libc::SIG_DFL);
+            }
+        }
     }
     for signal in [SIGTERM, SIGHUP] {
         // SAFETY: `SIG_DFL` 是合法处置值；重置后信号恢复操作系统默认行为。
@@ -80,25 +106,10 @@ pub fn uninstall_termination(ids: Vec<SigId>) {
     }
 }
 
-fn terminate(signal: i32) {
-    restore_terminal();
-    // SAFETY: `SIG_DFL` 是合法处置值；重发只影响本进程。
-    unsafe {
-        libc::signal(signal as libc::c_int, libc::SIG_DFL);
-        libc::raise(signal as libc::c_int);
-    }
-}
-
-/// 信号上下文里可用的恢复序列，与阅读器进入的序列一一对应。
-///
-/// 绕开 stdout 锁直接写 fd：主线程可能正在持锁渲染。
+/// 普通信号处理线程中的终端恢复序列，与阅读器进入的序列一一对应。
 fn restore_terminal() {
-    const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1000l\x1b[?1049l";
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = crossterm::terminal::disable_raw_mode();
-    // SAFETY: 只写 stdout 的静态字节序列。
-    unsafe {
-        libc::write(libc::STDOUT_FILENO, SEQ.as_ptr().cast(), SEQ.len());
-    }
 }
 
 #[cfg(test)]
