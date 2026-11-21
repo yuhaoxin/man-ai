@@ -72,6 +72,12 @@ pub fn uninstall_termination(ids: Vec<SigId>) {
     for id in ids {
         low_level::unregister(id);
     }
+    for signal in [SIGTERM, SIGHUP] {
+        // SAFETY: `SIG_DFL` 是合法处置值；重置后信号恢复操作系统默认行为。
+        unsafe {
+            libc::signal(signal as libc::c_int, libc::SIG_DFL);
+        }
+    }
 }
 
 fn terminate(signal: i32) {
