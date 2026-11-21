@@ -127,8 +127,8 @@ impl PageMetrics {
 fn non_cached_input(usage: &Usage) -> Option<u64> {
     Some(
         u64::from(usage.prompt_tokens?)
-            - u64::from(usage.cached_tokens?)
-            - u64::from(usage.cache_write_tokens.unwrap_or(0)),
+            .saturating_sub(u64::from(usage.cached_tokens?))
+            .saturating_sub(u64::from(usage.cache_write_tokens.unwrap_or(0))),
     )
 }
 
