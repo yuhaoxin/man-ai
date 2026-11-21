@@ -2,7 +2,8 @@
 //!
 //! 重试与回退不在这里：`post` 恰好发一次请求，由 `translate` 决定是否重试。
 //! `with_http_service(ReqwestService)` 是必须的，否则 async-openai 会自己重试 3 次。
-
+//! 响应用 byot 反序列化成自有类型：usage 字段缺失按未知（§8.3），端点载荷不全
+//! 不再让整帧反序列化失败。
 use std::time::Duration;
 
 use async_openai::config::OpenAIConfig;
@@ -10,11 +11,14 @@ use async_openai::error::OpenAIError;
 use async_openai::middleware::ReqwestService;
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestUserMessage, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, FinishReason, ReasoningEffort,
+    ChatCompletionRequestUserMessage, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, ReasoningEffort,
 };
 
 use async_openai::{Chat, Client};
+use futures::StreamExt;
+
+use serde::Deserialize;
 
 use crate::config::{Config, ReasoningEffort as ConfigEffort};
 
@@ -69,8 +73,106 @@ impl Failure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub content: String,
-    /// `finish_reason == "length"`：响应被 `max_tokens` 截断。
-    pub truncated: bool,
+    /// 流中出现过 `finish_reason == "stop"`（§7.4 采用条件之一）。
+    pub stopped: bool,
+    /// 流中最后一个非空 usage 块（§7.5）；缺失即未知，不按 0 补。
+    pub usage: Option<Usage>,
+}
+
+impl Completion {
+    fn empty() -> Self {
+        Self {
+            content: String::new(),
+            stopped: false,
+            usage: None,
+        }
+    }
+
+    /// 并进一帧（§7.3）：只累积 `choices[0]` 的 `delta.content`，finish_reason
+    /// 也只认该 choice 的；其余 choice 一律忽略。usage 取最后一个非空块（§7.5）。
+    fn fold(&mut self, chunk: StreamChunk, on_delta: &mut dyn FnMut(&str)) {
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage.into());
+        }
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return;
+        };
+        if let Some(text) = choice.delta.content {
+            self.content.push_str(&text);
+            on_delta(&text);
+        }
+        if let Some(reason) = choice.finish_reason {
+            self.stopped = reason == "stop";
+        }
+    }
+}
+
+/// 一次请求的 usage 原始值（§8.3 三口径的输入）。字段缺失即未知，不按 0 补；
+/// cache_write_tokens 缺失按 0：provider 未写入缓存。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    /// `prompt_tokens_details.cached_tokens`；缺失即未知。
+    pub cached_tokens: Option<u32>,
+    /// `prompt_tokens_details.cache_write_tokens`；缺失按 0 扣减。
+    pub cache_write_tokens: Option<u32>,
+}
+
+/// SSE 帧的自有反序列化形状（byot）：字段全部可缺，缺失即未知或空，
+/// 不因端点载荷不全而反序列化失败（§8.3）。
+#[derive(Deserialize)]
+struct StreamChunk {
+    /// 只有 `choices[0]` 参与（§7.3）。
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<RawUsage>,
+    /// OpenAI 兼容端点把流内错误写成 error 帧；出现即失败。
+    #[serde(default)]
+    error: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// usage 载荷：字段缺失即未知，不按 0 补（§8.3）。
+#[derive(Deserialize)]
+struct RawUsage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<RawPromptDetails>,
+}
+
+#[derive(Deserialize)]
+struct RawPromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
+}
+
+impl From<RawUsage> for Usage {
+    fn from(raw: RawUsage) -> Self {
+        let details = raw.prompt_tokens_details;
+        Self {
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            cached_tokens: details.as_ref().and_then(|details| details.cached_tokens),
+            cache_write_tokens: details.and_then(|details| details.cache_write_tokens),
+        }
+    }
 }
 
 /// 已规范化的后端：endpoint、model、密钥与 HTTP client。
@@ -81,6 +183,8 @@ pub struct Backend {
     model: String,
     reasoning_effort: Option<ConfigEffort>,
     max_tokens: Option<u32>,
+    /// 单次尝试总时限（§5.4）：发请求到流读完，由自有计时器执行。
+    timeout: Duration,
 }
 
 impl Backend {
@@ -101,9 +205,8 @@ impl Backend {
             None => return Err(not_configured("api_key")),
         };
 
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs_f64(config.timeout_seconds))
-            .redirect(reqwest::redirect::Policy::none());
+        // 不设 client 级超时：它先于自有计时器触发，且与断连在传输层不可区分（§5.4）。
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         if let Some(proxy) = &config.proxy {
             let proxy = reqwest::Proxy::all(proxy).map_err(|_| {
                 Failure::new(Reason::NotConfigured, false)
@@ -126,6 +229,7 @@ impl Backend {
             model: model.to_string(),
             reasoning_effort: config.reasoning_effort,
             max_tokens: config.max_tokens,
+            timeout: Duration::from_secs_f64(config.timeout_seconds),
         })
     }
 
@@ -135,9 +239,17 @@ impl Backend {
         (&self.endpoint, &self.model, effort)
     }
 
-    /// 单次尝试（§7.1、§10.3）。
+    /// 单次流式尝试（§7.1、§10.3）：固定 `stream: true` + `include_usage: true`。
+    ///
+    /// `on_delta` 随每个内容片段到达调用；自有计时器包住发请求到流读完
+    /// （§5.4），触发即 `timeout`、不重试。
     #[allow(deprecated)]
-    pub async fn post(&self, system: &str, user: &str) -> Result<Completion, Failure> {
+    pub async fn post(
+        &self,
+        system: &str,
+        user: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, Failure> {
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessage::from(system).into(),
             ChatCompletionRequestUserMessage::from(user).into(),
@@ -147,7 +259,11 @@ impl Backend {
             .model(&self.model)
             .messages(messages)
             .temperature(0.0_f32)
-            .stream(false);
+            .stream(true)
+            .stream_options(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                ..Default::default()
+            });
         if let Some(effort) = self.reasoning_effort {
             builder.reasoning_effort(openai_effort(effort));
         }
@@ -158,24 +274,40 @@ impl Backend {
             .build()
             .map_err(|_| Failure::new(Reason::BackendError, false))?;
 
-        let response = Chat::new(&self.client)
-            .create(request)
+        let attempt = self.stream(request, on_delta);
+        tokio::time::timeout(self.timeout, attempt)
+            .await
+            .map_err(|_| Failure::new(Reason::Timeout, false))?
+    }
+
+    /// 消费流到读完：累积 `delta.content`、记录 finish_reason 与最后一个非空
+    /// usage 块（§7.3、§7.5）；reasoning 等其余字段一律忽略。
+    async fn stream(
+        &self,
+        request: CreateChatCompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, Failure> {
+        let mut stream = Chat::new(&self.client)
+            .create_stream_byot::<_, StreamChunk>(request)
             .await
             .map_err(|error| self.classify(error))?;
-        completion(response)
+        let mut completion = Completion::empty();
+        while let Some(chunk) = stream.next().await {
+            // 2xx 之后的流错误（error 帧、断连、帧解码失败）一律可重试
+            // `backend error`（§7.5）。
+            let chunk = chunk.map_err(|error| self.classify(error))?;
+            if chunk.error.is_some() {
+                return Err(Failure::new(Reason::BackendError, true));
+            }
+            completion.fold(chunk, on_delta);
+        }
+        Ok(completion)
     }
 
     fn classify(&self, error: OpenAIError) -> Failure {
         match error {
-            OpenAIError::Reqwest(error) => {
-                if error.is_timeout() {
-                    Failure::new(Reason::Timeout, false)
-                } else if error.is_connect() {
-                    Failure::new(Reason::Unreachable, true)
-                } else {
-                    // 响应体残缺、连接中断等：可重试一次。
-                    Failure::new(Reason::BackendError, true)
-                }
+            OpenAIError::Reqwest(error) if error.is_connect() => {
+                Failure::new(Reason::Unreachable, true)
             }
             OpenAIError::ApiError(response) => {
                 let status = response.status_code;
@@ -183,7 +315,8 @@ impl Backend {
                 Failure::new(Reason::BackendError, retryable)
                     .with_diagnostic(http_diagnostic(status, &response.api_error))
             }
-            // 非 JSON、结构不符、空响应。
+            // 非 JSON、结构不符、空响应与流内错误：可重试一次。
+            // 超时不在这里：client 不设 `.timeout`，超时由自有计时器判定（§5.4）。
             _ => Failure::new(Reason::BackendError, true),
         }
     }
@@ -238,22 +371,6 @@ fn http_diagnostic(status: reqwest::StatusCode, error: &async_openai::error::Api
         line.push_str(&format!("; error.type={kind}"));
     }
     line
-}
-
-fn completion(response: CreateChatCompletionResponse) -> Result<Completion, Failure> {
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| Failure::new(Reason::BackendError, true))?;
-    let content = choice
-        .message
-        .content
-        .ok_or_else(|| Failure::new(Reason::BackendError, true))?;
-    Ok(Completion {
-        content,
-        truncated: choice.finish_reason == Some(FinishReason::Length),
-    })
 }
 
 #[cfg(test)]
@@ -325,5 +442,153 @@ mod tests {
         cfg.model = Some("m".to_string());
         cfg.proxy = Some("socks5://127.0.0.1:1080".to_string());
         assert!(Backend::from_config(&cfg).is_ok());
+    }
+
+    /// 起一个一次性 SSE 端点：接受一个连接，写入 `body` 后关闭。
+    /// 返回 endpoint；`post` 的整个流程都在同一个 runtime 里跑完。
+    async fn sse_endpoint(body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        endpoint
+    }
+
+    fn local_backend(endpoint: &str) -> Backend {
+        let mut cfg = config();
+        cfg.endpoint = Some(endpoint.to_string());
+        cfg.model = Some("m".to_string());
+        Backend::from_config(&cfg).unwrap()
+    }
+
+    fn chunk_frame(content: &str, finish: Option<&str>, usage: &str) -> String {
+        let mut frame = format!(
+            "{{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}\
+             {}}}]",
+            finish.map(|f| format!(",\"finish_reason\":\"{f}\"")).unwrap_or_default()
+        );
+        if !usage.is_empty() {
+            frame.push_str(&format!(",\"usage\":{usage}"));
+        }
+        frame.push('}');
+        format!("data: {frame}\n\n")
+    }
+
+    #[test]
+    fn 流式累积且_usage_取最后一个非空块() {
+        // 首帧挂 usage（DeepSeek 形态），末尾独立 usage 块覆盖它（OpenAI 形态）。
+        let usage_frame = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,",
+            "\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":130,",
+            "\"completion_tokens\":9,\"total_tokens\":139,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":64}}}\n\n",
+        );
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}{}{}{}data: [DONE]\n\n",
+            chunk_frame("He", None, "{\"prompt_tokens\":120,\"completion_tokens\":7,\"total_tokens\":127,\"prompt_tokens_details\":{\"cached_tokens\":64}}"),
+            chunk_frame("llo", None, ""),
+            chunk_frame("", Some("stop"), ""),
+            usage_frame,
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let endpoint = sse_endpoint(body).await;
+            let backend = local_backend(&endpoint);
+            let mut seen = String::new();
+            let completion = backend
+                .post("sys", "user", &mut |chunk| seen.push_str(chunk))
+                .await
+                .unwrap();
+            assert_eq!(completion.content, "Hello");
+            assert!(completion.stopped);
+            assert_eq!(
+                completion.usage,
+                Some(Usage {
+                    prompt_tokens: Some(130),
+                    completion_tokens: Some(9),
+                    cached_tokens: Some(64),
+                    cache_write_tokens: None,
+                })
+            );
+            // 增量随帧到达调用方（DeepSeek 挂在内容块、OpenRouter 总附带都覆盖）。
+            assert_eq!(seen, "Hello");
+        });
+    }
+
+    #[test]
+    fn usage_缺失即未知且中途_error_帧可重试() {
+        let no_usage = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}{}data: [DONE]\n\n",
+            chunk_frame("ok", None, ""),
+            chunk_frame("", Some("stop"), ""),
+        );
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let endpoint = sse_endpoint(no_usage).await;
+            let backend = local_backend(&endpoint);
+            let completion = backend.post("sys", "user", &mut |_| {}).await.unwrap();
+            assert_eq!(completion.usage, None, "缺失即未知，不按 0 补");
+            assert!(completion.stopped);
+        });
+
+        let error_frame = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}data: {{\"error\":{{\"message\":\"boom\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n",
+            chunk_frame("半截", None, ""),
+        );
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let endpoint = sse_endpoint(error_frame).await;
+            let backend = local_backend(&endpoint);
+            let failure = backend.post("sys", "user", &mut |_| {}).await.unwrap_err();
+            // 中途 error 帧由自有响应类型显式识别：2xx 之后一律可重试 backend error。
+            assert_eq!(failure.reason, Reason::BackendError);
+            assert!(failure.retryable);
+        });
+    }
+
+    #[test]
+    fn 并列choice只取第一个() {
+        // §7.3：只累积 choices[0]；其余 choice 的内容与 finish_reason 一律忽略。
+        let frame = concat!(
+            r#"{"choices":[{"index":0,"delta":{"content":"甲"},"finish_reason":"stop"},"#,
+            r#"{"index":1,"delta":{"content":"乙"},"finish_reason":"length"}]}"#
+        );
+        let chunk: StreamChunk = serde_json::from_str(frame).unwrap();
+        let mut completion = Completion::empty();
+        completion.fold(chunk, &mut |_| {});
+        assert_eq!(completion.content, "甲");
+        assert!(completion.stopped);
+    }
+
+    #[test]
+    fn usage缺字段按未知解析不回退() {
+        // §8.3：字段缺失即未知，不按 0 补；缺字段的 usage 不让整块回退。
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}{}data: [DONE]\n\n",
+            chunk_frame("ok", None, r#"{"prompt_tokens":100,"total_tokens":100}"#),
+            chunk_frame("", Some("stop"), ""),
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let endpoint = sse_endpoint(body).await;
+            let backend = local_backend(&endpoint);
+            let completion = backend.post("sys", "user", &mut |_| {}).await.unwrap();
+            assert_eq!(completion.content, "ok");
+            assert!(completion.stopped);
+            assert_eq!(
+                completion.usage,
+                Some(Usage {
+                    prompt_tokens: Some(100),
+                    completion_tokens: None,
+                    cached_tokens: None,
+                    cache_write_tokens: None,
+                })
+            );
+        });
     }
 }

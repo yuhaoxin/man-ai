@@ -5,15 +5,15 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Command, ExitStatus, Stdio};
 
 use crate::backend::Backend;
 use crate::cache;
 use crate::config::Config;
 use crate::language::Language;
 use crate::translate::PipelineCtx;
-use crate::{blocks, cli, config, klist, output, pager, translate};
+use crate::{blocks, cli, config, output, translate};
 
 /// `-P` 让路时写到 stderr 的一行（§4.3）。程序输出一律英文。
 pub const PAGER_OVERRIDE_NOTE: &str = "man-ai: -P overrides MANPAGER; not translating";
@@ -30,21 +30,10 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
     if scan.passthrough {
         return exec_man(&own.rest);
     }
-    // §5.4：命中 `-k`/`-f` 时拦截；`--no-translate`、en 与「非 TTY 且无 --translate」除外。
-    let stdout_tty = io::stdout().is_terminal();
-    if scan.kf && own.translate != Some(false) && (stdout_tty || own.translate == Some(true)) {
-        let loaded = config::load(config::config_path().as_deref());
-        let language = resolve_language(&loaded, lang);
-        // §11.3：en 不拦截、不设 MANPAGER、不写 stderr。
-        if language.is_english() {
-            return exec_man(&own.rest);
-        }
-        for warning in &loaded.warnings {
-            eprintln!("{warning}");
-        }
-        // 用户原有的 MANPAGER 仍是 -k 结果的内层分页器（§5.5）。
-        save_manpager();
-        return klist::run(&own.rest, &language, &loaded.config, stdout_tty);
+    // §3.3：-k/-f 是用法错误，入口判定优先于翻译开关与语言。
+    if let Some(option) = scan.kf {
+        eprintln!("man-ai: unsupported option {option}; run man {option} directly");
+        return 2;
     }
     // §5.3：非 TTY 的 --translate 捕获 man 输出后翻译。
     if own.translate == Some(true) && !io::stdout().is_terminal() {
@@ -57,8 +46,10 @@ pub fn run(own: &cli::OwnArgs, lang: Option<&str>) -> i32 {
             return capture_and_translate(own, &language, &loaded.config);
         }
     }
-    save_manpager();
-    set_env("MANPAGER", manpager_value(lang, own.translate));
+    set_env(
+        "MANPAGER",
+        manpager_value(lang, own.retranslate, own.translate),
+    );
     exec_man(&own.rest)
 }
 
@@ -96,7 +87,7 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
         Ok(output) => output,
         Err(_) => return 127,
     };
-    let code = pager::exit_code(output.status);
+    let code = exit_code(output.status);
     if output.stdout.is_empty() {
         return code;
     }
@@ -118,33 +109,36 @@ fn capture_and_translate(own: &cli::OwnArgs, lang: &Language, config: &Config) -
             None
         }
     };
-    let mut out = output::Out::new(false, Vec::new());
+    let mut out = output::Out::stdout();
     let ctx = PipelineCtx {
         lang,
         backend: backend.as_ref(),
         cache: &cache,
         concurrency: config.concurrency,
+        retranslate: own.retranslate,
     };
-    if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out)) {
-        if outcome.all_failed() {
-            if let Some(reason) = outcome.reason {
-                eprintln!(
-                    "man-ai: translation failed ({}), showing the original below",
-                    reason.as_str()
-                );
-            }
-        }
+    if let Ok(outcome) = translate::block_on(translate::run_page(page, ctx, &mut out))
+        && outcome.all_failed()
+        && let Some(reason) = outcome.reason
+    {
+        eprintln!(
+            "man-ai: translation failed ({}), showing the original below",
+            reason.as_str()
+        );
     }
     let _ = out.finish();
     code
 }
 
-/// `MANPAGER="man-ai [--lang <规范标签>] [--translate|--no-translate]"`（§4.2）。
-fn manpager_value(lang: Option<&str>, translate: Option<bool>) -> String {
+/// `MANPAGER="man-ai [--lang <规范标签>] [--retranslate] [--translate|--no-translate]"`（§4.2）。
+fn manpager_value(lang: Option<&str>, retranslate: bool, translate: Option<bool>) -> String {
     let mut value = String::from("man-ai");
     if let Some(tag) = lang {
         value.push_str(" --lang ");
         value.push_str(tag);
+    }
+    if retranslate {
+        value.push_str(" --retranslate");
     }
     match translate {
         Some(true) => value.push_str(" --translate"),
@@ -152,20 +146,6 @@ fn manpager_value(lang: Option<&str>, translate: Option<bool>) -> String {
         None => {}
     }
     value
-}
-
-/// 把用户原有的 `MANPAGER` 存进 `MAN_AI_PAGER`；指向自身时不写（§5.1 第 8 条）。
-fn save_manpager() {
-    let Some(original) = env::var_os("MANPAGER") else {
-        return;
-    };
-    if original.is_empty() {
-        return;
-    }
-    if original.to_str().is_some_and(pager::points_to_self) {
-        return;
-    }
-    set_env("MAN_AI_PAGER", original);
 }
 
 fn set_env(key: &str, value: impl Into<OsString>) {
@@ -178,18 +158,35 @@ fn exec_man(args: &[OsString]) -> i32 {
     127
 }
 
+/// 子进程被信号杀死时为 `128 + 信号编号`（§4.4）。
+fn exit_code(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn manpager_值按规格拼接() {
-        assert_eq!(manpager_value(None, None), "man-ai");
-        assert_eq!(manpager_value(Some("zh-CN"), None), "man-ai --lang zh-CN");
-        assert_eq!(manpager_value(None, Some(true)), "man-ai --translate");
+        assert_eq!(manpager_value(None, false, None), "man-ai");
         assert_eq!(
-            manpager_value(Some("ja"), Some(false)),
+            manpager_value(Some("zh-CN"), false, None),
+            "man-ai --lang zh-CN"
+        );
+        assert_eq!(
+            manpager_value(None, false, Some(true)),
+            "man-ai --translate"
+        );
+        assert_eq!(
+            manpager_value(Some("ja"), false, Some(false)),
             "man-ai --lang ja --no-translate"
+        );
+        assert_eq!(
+            manpager_value(Some("zh-CN"), true, Some(true)),
+            "man-ai --lang zh-CN --retranslate --translate"
         );
     }
 }

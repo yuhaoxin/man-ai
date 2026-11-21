@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
@@ -103,24 +103,6 @@ pub fn env_refs<'a>(env: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)
         .collect()
 }
 
-/// `v1` 下的缓存条目文件数（不含 tmp）。
-pub fn entries(dir: &TempDir) -> usize {
-    let v1 = dir.file("cache").join("man-ai").join("v1");
-    fs::read_dir(&v1)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|shard| shard.file_name() != "tmp")
-        .map(|shard| {
-            fs::read_dir(shard.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .count()
-        })
-        .sum()
-}
-
 // ---------------------------------------------------------------- 普通运行
 
 pub struct Run {
@@ -179,50 +161,6 @@ pub struct PtyRun {
 
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// 分页器模式 + stdout 是 TTY：stdin 从文件重定向（非 TTY），页面交给内层分页器。
-///
-/// 内层分页器用 `MAN_AI_PAGER=cat`，输出与 stdin 字节一致。
-pub fn run_pager_tty(
-    dir: &TempDir,
-    args: &[&str],
-    stdin: &[u8],
-    extra_env: &[(&str, &str)],
-) -> PtyRun {
-    run_pager_tty_with_pid(dir, args, stdin, extra_env, |_| {})
-}
-
-/// 同上，但在读输出期间把 man-ai 的 pid 交给 `hook`（发信号、等文件标记用）。
-pub fn run_pager_tty_with_pid(
-    dir: &TempDir,
-    args: &[&str],
-    stdin: &[u8],
-    extra_env: &[(&str, &str)],
-    hook: impl FnOnce(u32) + Send + 'static,
-) -> PtyRun {
-    let input = dir.file("stdin.bin");
-    fs::write(&input, stdin).unwrap();
-    let stderr_file = dir.file("stderr.txt");
-    let mut script = String::from("exec ");
-    script.push_str(&sh_quote(BIN));
-    for arg in args {
-        script.push(' ');
-        script.push_str(&sh_quote(arg));
-    }
-    script.push_str(&format!(
-        " <{} 2>{}",
-        sh_quote(input.to_str().unwrap()),
-        sh_quote(stderr_file.to_str().unwrap())
-    ));
-    let mut extra = vec![("MAN_AI_PAGER", "cat")];
-    extra.extend_from_slice(extra_env);
-    let run = run_pty_script_with(dir, &script, &extra, hook);
-    PtyRun {
-        output: strip_carriage_returns(run.output),
-        stderr: fs::read_to_string(&stderr_file).unwrap_or_default(),
-        code: run.code,
-    }
 }
 
 /// pty 的输出换行是 `\r\n`，比较前归一成 `\n`。
@@ -337,47 +275,254 @@ fn run_pty_script_with(
     RawPtyRun { output, code }
 }
 
-// ---------------------------------------------------------------- 假分页器
+// ---------------------------------------------------------------- 阅读器 pty
 
-/// 边读边记录的内层分页器：启动时写 `<name>.start` 标记（证明首屏），
-/// 每读到一行同时追加到 `<name>.log` 并回显到 stdout。
-pub fn recording_pager(dir: &TempDir, name: &str) -> PathBuf {
-    let start = dir.file(&format!("{name}.start"));
-    let log = dir.file(&format!("{name}.log"));
-    let path = dir.file(&format!("{name}-pager"));
-    write_script(
-        &path,
-        &format!(
-            "#!/bin/sh\necho started > '{}'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  printf '%s\\n' \"$line\"\ndone\n",
-            start.display(),
-            log.display()
-        ),
-    );
-    path
-}
-
-/// 只读一个字节就退出的分页器：用于 EPIPE（退出码 7）。
-pub fn quitting_pager(dir: &TempDir, name: &str) -> PathBuf {
-    let path = dir.file(&format!("{name}-pager"));
-    write_script(&path, "#!/bin/sh\nhead -c 1 >/dev/null\nexit 7\n");
-    path
-}
-
-/// 记录分页器收到的行（含页首/尾行，pty 的 `\r\n` 已归一）。
-pub fn pager_log(dir: &TempDir, name: &str) -> Vec<String> {
-    fs::read_to_string(dir.file(&format!("{name}.log")))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// 往进程发 SIGINT；`/bin/kill` 在 macOS 与 Linux 都有。
-pub fn send_sigint(pid: u32) -> bool {
+/// 往进程发信号；`/bin/kill` 在 macOS 与 Linux 都有。
+pub fn send_signal(pid: u32, signal: &str) -> bool {
     Command::new("/bin/kill")
-        .args(["-INT", &pid.to_string()])
+        .args([format!("-{signal}"), pid.to_string()])
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// 阅读器在 pty 上的运行结果。
+pub struct ReaderRun {
+    /// pty 原始输出，保留 ANSI 序列。
+    pub raw: Vec<u8>,
+    pub code: i32,
+    pub stderr: String,
+}
+
+impl ReaderRun {
+    /// 去掉 pty 的 `\r` 后的有损解码文本。
+    pub fn text(&self) -> String {
+        plain(&self.raw)
+    }
+}
+
+/// 在 pty 下跑分页器模式 + stdout 是 TTY：阅读器接管终端。
+///
+/// 输出出现 `expect` 后把 `keys` 逐个写进 pty（作为按键）。`expect` 为空串时
+/// 等一拍就按（信号与初始化失败类测试用）。
+pub fn run_reader_tty(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, String)],
+    expect: &str,
+    keys: &[&str],
+) -> ReaderRun {
+    let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+    run_reader_driven(
+        dir,
+        args,
+        stdin,
+        extra_env,
+        expect,
+        move |_pid, writer, _seen| {
+            std::thread::sleep(Duration::from_millis(200));
+            for key in &keys {
+                let _ = writer.write_all(key.as_bytes());
+                let _ = writer.flush();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        },
+    )
+}
+
+/// 同上，但触发后给进程发信号而不是按键。
+pub fn run_reader_signaled(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, String)],
+    expect: &str,
+    signal: &str,
+) -> ReaderRun {
+    let signal = signal.to_string();
+    run_reader_driven(
+        dir,
+        args,
+        stdin,
+        extra_env,
+        expect,
+        move |pid, _writer, _seen| {
+            std::thread::sleep(Duration::from_millis(200));
+            send_signal(pid, &signal);
+        },
+    )
+}
+
+/// pty 输出的空格不可靠：ratatui 的帧 diff 会跳过未变化的空白格，
+/// 比较前一律去掉空格。
+pub fn compact(text: &str) -> String {
+    text.replace(' ', "")
+}
+
+/// pty 原始输出的可读文本：剥 ANSI 序列与控制字符。
+/// 光标定位序列夹在文字中间，不剥掉就没法做包含断言。
+pub fn plain(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(current) = chars.next() {
+        match current {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            control if control.is_control() => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// pty 驱动：自定义脚本 + 自定义动作。输出（去掉空格后）出现 `expect` 时执行
+/// `action`（按键或发信号），然后等进程退出。读 pty 一直在后台线程，
+/// `action` 期间输出照常排空；`seen` 是实时输出的共享句柄，多阶段动作可以
+/// 轮询它。
+pub fn run_pty_driven<F>(
+    dir: &TempDir,
+    script: &str,
+    stderr_file: &Path,
+    extra_env: &[(&str, String)],
+    expect: &str,
+    action: F,
+) -> ReaderRun
+where
+    F: FnOnce(u32, &mut dyn Write, &Arc<Mutex<Vec<u8>>>) + Send + 'static,
+{
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.args(["-c", script]);
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("HOME", dir.path().to_str().unwrap());
+    command.env("XDG_CONFIG_HOME", dir.xdg().to_str().unwrap());
+    command.env("TERM", "xterm-256color");
+    command.env("MANWIDTH", "80");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let pid = child.process_id().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let pump = std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(size) => sink.lock().unwrap().extend_from_slice(&buffer[..size]),
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let needle = compact(expect);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let snapshot = seen.lock().unwrap().clone();
+        let found = needle.is_empty() || compact(&plain(&snapshot)).contains(&needle);
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "60 秒内未见 {expect:?}，已读：{}",
+            String::from_utf8_lossy(&snapshot)
+        );
+    }
+    action(pid, &mut *writer, &seen);
+    let _ = pump.join();
+    // 直接 waitpid：portable-pty 的 exit_code 把信号死压成 1，
+    // 契约要的是 shell 口径 128+n。
+    let mut raw_status: libc::c_int = 0;
+    // SAFETY: `pid` 是本 harness 起的子进程，只等待一次。
+    unsafe {
+        libc::waitpid(pid as libc::pid_t, &mut raw_status, 0);
+    }
+    let code = if libc::WIFEXITED(raw_status) {
+        libc::WEXITSTATUS(raw_status) as i32
+    } else if libc::WIFSIGNALED(raw_status) {
+        128 + libc::WTERMSIG(raw_status) as i32
+    } else {
+        // waitpid 只报告退出或信号终止两种处置；其它状态在契约之外。
+        unreachable!("waitpid 状态既非退出也非信号: {raw_status}")
+    };
+    ReaderRun {
+        raw: seen.lock().unwrap().clone(),
+        code,
+        stderr: fs::read_to_string(stderr_file).unwrap_or_default(),
+    }
+}
+
+/// 阅读器交互驱动：输出出现 `expect` 后执行 `action`（按键或发信号），
+/// 然后等进程退出。
+pub fn run_reader_driven<F>(
+    dir: &TempDir,
+    args: &[&str],
+    stdin: &[u8],
+    extra_env: &[(&str, String)],
+    expect: &str,
+    action: F,
+) -> ReaderRun
+where
+    F: FnOnce(u32, &mut dyn Write, &Arc<Mutex<Vec<u8>>>) + Send + 'static,
+{
+    let input = dir.file("stdin.bin");
+    fs::write(&input, stdin).unwrap();
+    let stderr_file = dir.file("stderr.txt");
+    let mut script = String::from("exec ");
+    script.push_str(&sh_quote(BIN));
+    for arg in args {
+        script.push(' ');
+        script.push_str(&sh_quote(arg));
+    }
+    script.push_str(&format!(
+        " <{} 2>{}",
+        sh_quote(input.to_str().unwrap()),
+        sh_quote(stderr_file.to_str().unwrap())
+    ));
+    run_pty_driven(dir, &script, &stderr_file, extra_env, expect, action)
+}
+
+/// 等到实时输出里出现 `needle`（已剥 ANSI、去空格）。
+pub fn wait_seen(seen: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = seen.lock().unwrap().clone();
+        if compact(&plain(&snapshot)).contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{timeout:?} 内未见 {needle:?}，已读：{}",
+            plain(&snapshot)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 // ---------------------------------------------------------------- 假 man
@@ -393,22 +538,6 @@ pub fn fake_man(dir: &TempDir, page: &[u8], code: i32) -> PathBuf {
         &dir.file("man"),
         &format!(
             "#!/bin/sh\nprintf '%s' \"${{MANPAGER-<unset>}}\" > '{}'\ncat '{}'\nexit {code}\n",
-            record.display(),
-            fixture.display()
-        ),
-    );
-    record
-}
-
-/// 写一个假 `man -k`：输出结果行，并把收到的 `WHATISPAGER` 记录到 `whatispager-record.txt`。
-pub fn fake_kman(dir: &TempDir, output: &[u8], code: i32) -> PathBuf {
-    let fixture = dir.file("kpage.bin");
-    fs::write(&fixture, output).unwrap();
-    let record = dir.file("whatispager-record.txt");
-    write_script(
-        &dir.file("man"),
-        &format!(
-            "#!/bin/sh\nprintf '%s' \"${{WHATISPAGER-<unset>}}\" > '{}'\n/bin/cat '{}'\nexit {code}\n",
             record.display(),
             fixture.display()
         ),
@@ -566,7 +695,7 @@ pub fn assert_bytes_eq(ours: &[u8], baseline: &[u8], label: &str) {
 
 #[derive(Clone)]
 pub enum Reply {
-    /// 200 + JSON。
+    /// 200：脚本化的完整 chat.completion JSON，转成 SSE 流（§7.1 客户端固定流式）。
     Ok(Value),
     /// 指定状态码 + JSON。
     Status(u16, Value),
@@ -576,6 +705,65 @@ pub enum Reply {
     Delay(Duration, Value),
     /// 等指定文件出现再回 200 + JSON：让慢块由测试观察到的同步信号放行，而不是固定计时窗口。
     AwaitFile(PathBuf, Duration, Value),
+    /// 逐帧 SSE：每帧发出前等待指定时长；`done` 决定是否补 `data: [DONE]`。
+    /// 帧用 [`chunk`]/[`usage_chunk`] 构造；`done = false` 模拟流中途断开。
+    Sse(Vec<(Duration, Value)>, bool),
+}
+
+/// 一帧 `chat.completion.chunk`；`usage` 只在需要展示时挂上。
+pub fn chunk(content: Option<&str>, finish: Option<&str>, usage: Option<Value>) -> Value {
+    let mut delta = json!({});
+    if let Some(content) = content {
+        delta["content"] = json!(content);
+    }
+    let mut choice = json!({"index": 0, "delta": delta});
+    if let Some(finish) = finish {
+        choice["finish_reason"] = json!(finish);
+    }
+    let mut frame = json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": [choice],
+    });
+    if let Some(usage) = usage {
+        frame["usage"] = usage;
+    }
+    frame
+}
+
+/// 独立 usage 块：`choices` 为空数组（§7.5 OpenAI 形态）。
+pub fn usage_chunk(usage: Value) -> Value {
+    json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": [],
+        "usage": usage,
+    })
+}
+
+/// 把脚本化的完整 chat.completion JSON 转成 SSE 响应体：
+/// 内容 delta 帧 → finish 帧（脚本里有才发）→ usage 帧（脚本里有才发）→ [DONE]。
+fn completion_to_sse(value: &Value) -> String {
+    let mut body = String::new();
+    if let Some(content) = value["choices"][0]["message"]["content"].as_str() {
+        body.push_str(&sse_line(&chunk(Some(content), None, None)));
+    }
+    if let Some(finish) = value["choices"][0]["finish_reason"].as_str() {
+        body.push_str(&sse_line(&chunk(None, Some(finish), None)));
+    }
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+        body.push_str(&sse_line(&usage_chunk(usage.clone())));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn sse_line(frame: &Value) -> String {
+    format!("data: {frame}\n\n")
 }
 
 #[derive(Clone, Debug)]
@@ -689,23 +877,44 @@ async fn handle_model_request(State(state): State<Arc<ModelState>>, request: Req
     let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(now, Ordering::SeqCst);
     let response = match reply {
-        Reply::Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Reply::Ok(value) => sse_response(completion_to_sse(&value)),
         Reply::Status(code, value) => (status(code), Json(value)).into_response(),
         Reply::Raw(code, body) => (status(code), body).into_response(),
         Reply::Delay(delay, value) => {
             tokio::time::sleep(delay).await;
-            (StatusCode::OK, Json(value)).into_response()
+            sse_response(completion_to_sse(&value))
         }
         Reply::AwaitFile(path, timeout, value) => {
             let deadline = tokio::time::Instant::now() + timeout;
             while !path.exists() && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            (StatusCode::OK, Json(value)).into_response()
+            sse_response(completion_to_sse(&value))
+        }
+        Reply::Sse(frames, done) => {
+            let mut body = String::new();
+            for (delay, frame) in frames {
+                tokio::time::sleep(delay).await;
+                body.push_str(&sse_line(&frame));
+            }
+            if done {
+                body.push_str("data: [DONE]\n\n");
+            }
+            sse_response(body)
         }
     };
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
     response
+}
+
+/// 200 + SSE 响应体。
+fn sse_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        body,
+    )
+        .into_response()
 }
 
 fn status(code: u16) -> StatusCode {

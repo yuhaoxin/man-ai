@@ -42,28 +42,48 @@ fn 不翻译路径与平台_man_字节一致() {
         return;
     };
     let page = "1 man-ai-fixture";
+    // 管道（非 TTY）下的直写路径：`man 页 | man-ai …` 与 `man 页` 逐字节一致。
+    let run = |command: &str, lc_all: &str| {
+        let stderr_file = real.dir.file("diff.stderr");
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env_clear()
+            .env("PATH", &real.base_path)
+            .env("HOME", real.dir.path())
+            .env("MANPATH", real.manpath())
+            .env("MANWIDTH", "80")
+            .env("TERM", "dumb")
+            .env("LC_ALL", lc_all)
+            .env("MANPAGER", "cat")
+            .stderr(std::fs::File::create(&stderr_file).unwrap())
+            .output()
+            .unwrap();
+        (
+            output.stdout,
+            std::fs::read_to_string(&stderr_file).unwrap_or_default(),
+            output.status.code(),
+        )
+    };
 
-    let (baseline, baseline_stderr, baseline_code) = real.run(
-        "baseline",
-        &real.man_command(page),
-        &[("MANPAGER", "cat")],
-        "C.UTF-8",
-    );
-    assert_eq!(baseline_code, 0, "基线 man 失败：{baseline_stderr}");
+    let (baseline, baseline_stderr, baseline_code) = run(&real.man_command(page), "C.UTF-8");
+    assert_eq!(baseline_code, Some(0), "基线 man 失败：{baseline_stderr}");
     assert_eq!(baseline_stderr, "", "基线 man 写了 stderr");
     assert!(!baseline.is_empty(), "基线没有输出，fixture 页可能没找到");
 
     // 四条不翻译路径；各自与同一次基线比。
-    for (label, manpager, lc_all) in [
-        ("--no-translate", "man-ai --no-translate", "C.UTF-8"),
-        ("--lang en", "man-ai --lang en", "C.UTF-8"),
-        ("LC_ALL=C", "man-ai", "C"),
-        ("LC_ALL=POSIX", "man-ai", "POSIX"),
+    for (label, man_ai_args, lc_all) in [
+        ("--no-translate", "--no-translate", "C.UTF-8"),
+        ("--lang en", "--lang en", "C.UTF-8"),
+        ("LC_ALL=C", "", "C"),
+        ("LC_ALL=POSIX", "", "POSIX"),
     ] {
-        let (ours, ours_stderr, ours_code) = real.run(
-            &format!("ours-{}", label.replace([' ', '='], "-")),
-            &real.man_command(page),
-            &[("MANPAGER", manpager), ("MAN_AI_PAGER", "cat")],
+        let (ours, ours_stderr, ours_code) = run(
+            &format!(
+                "{} | {} {man_ai_args}",
+                real.man_command(page),
+                shell_quote_str(BIN)
+            ),
             lc_all,
         );
         assert_eq!(ours_stderr, "", "{label} man-ai 路径写了 stderr");
@@ -126,7 +146,6 @@ fn 非_tty_默认路径与平台_man_字节一致() {
             .env("MANWIDTH", "80")
             .env("TERM", "dumb")
             .env("MANPAGER", "cat")
-            .env("MAN_AI_PAGER", "cat")
             .stderr(fs::File::create(&stderr_file).unwrap())
             .output()
             .unwrap();
