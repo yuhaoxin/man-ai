@@ -96,7 +96,7 @@ fn pager_mode(own: &cli::OwnArgs, cli_lang: Option<Language>) -> i32 {
         }
     }
     // §4.2：剥离自有参数后残留的 argv 警告一行后继续。
-    if !own.rest.is_empty() {
+    if !lang.is_english() && !own.rest.is_empty() {
         let args = own
             .rest
             .iter()
